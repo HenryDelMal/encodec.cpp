@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export an official Meta EnCodec checkpoint for the Eigen decoder runtime."""
+"""Export an official Meta EnCodec checkpoint for the Eigen runtime."""
 
 import argparse
 import struct
@@ -9,7 +9,8 @@ import torch
 
 
 MAGIC = b"ENCDMOD\0"
-VERSION = 1
+DECODER_ONLY_VERSION = 1
+COMBINED_VERSION = 2
 FLAG_CAUSAL = 1
 FLAG_NORMALIZED = 2
 
@@ -51,28 +52,55 @@ def decoder_tensors(state, normalized):
     yield from convolution(state, "decoder.model.15.conv.conv", False, normalized)
 
 
-def export(checkpoint, output, sample_rate):
+def encoder_tensors(state, normalized):
+    yield from convolution(state, "encoder.model.0.conv.conv", False, normalized)
+    for residual, downsample in ((1, 3), (4, 6), (7, 9), (10, 12)):
+        yield from convolution(state, f"encoder.model.{residual}.block.1.conv.conv", False, normalized)
+        yield from convolution(state, f"encoder.model.{residual}.block.3.conv.conv", False, normalized)
+        yield from convolution(state, f"encoder.model.{residual}.shortcut.conv.conv", False, normalized)
+        yield from convolution(state, f"encoder.model.{downsample}.conv.conv", False, normalized)
+
+    for layer in range(2):
+        prefix = "encoder.model.13.lstm."
+        for item in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
+            yield tensor(state, f"{prefix}{item}_l{layer}").flatten()
+    yield from convolution(state, "encoder.model.15.conv.conv", False, normalized)
+
+
+def export(checkpoint, output, sample_rate, include_encoder):
     state = torch.load(checkpoint, map_location="cpu")
     if sample_rate == 24000:
         channels, max_quantizers, flags = 1, 32, FLAG_CAUSAL
     else:
         channels, max_quantizers, flags = 2, 16, FLAG_NORMALIZED
 
-    decoder = torch.cat(list(decoder_tensors(state, bool(flags & FLAG_NORMALIZED))))
+    normalized = bool(flags & FLAG_NORMALIZED)
+    encoder = (torch.cat(list(encoder_tensors(state, normalized)))
+               if include_encoder else torch.empty(0, dtype=torch.float32))
+    decoder = torch.cat(list(decoder_tensors(state, normalized)))
     rvq = torch.cat([
         tensor(state, f"quantizer.vq.layers.{level}._codebook.embed").flatten()
         for level in range(max_quantizers)
     ])
-    header = struct.pack("<8s7I", MAGIC, VERSION, sample_rate, channels,
-                         max_quantizers, flags, decoder.numel(), rvq.numel())
+    if include_encoder:
+        header = struct.pack("<8s8I", MAGIC, COMBINED_VERSION, sample_rate, channels,
+                             max_quantizers, flags, encoder.numel(), decoder.numel(),
+                             rvq.numel())
+    else:
+        header = struct.pack("<8s7I", MAGIC, DECODER_ONLY_VERSION, sample_rate,
+                             channels, max_quantizers, flags, decoder.numel(),
+                             rvq.numel())
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as stream:
         stream.write(header)
+        if include_encoder:
+            stream.write(encoder.numpy().tobytes())
         stream.write(decoder.numpy().tobytes())
         stream.write(rvq.numpy().tobytes())
     print(f"Wrote {output} ({output.stat().st_size / 1024 / 1024:.1f} MiB)")
     print(f"  {sample_rate} Hz, {channels} channel(s), {max_quantizers} codebooks")
-    print(f"  decoder={decoder.numel()} floats, rvq={rvq.numel()} floats")
+    print(f"  encoder={encoder.numel()} floats, decoder={decoder.numel()} floats, "
+          f"rvq={rvq.numel()} floats")
 
 
 def main():
@@ -80,8 +108,10 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--sample-rate", type=int, choices=(24000, 48000), required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--include-encoder", action="store_true",
+                        help="write a version-2 model containing encoder and decoder weights")
     args = parser.parse_args()
-    export(args.checkpoint, args.output, args.sample_rate)
+    export(args.checkpoint, args.output, args.sample_rate, args.include_encoder)
 
 
 if __name__ == "__main__":

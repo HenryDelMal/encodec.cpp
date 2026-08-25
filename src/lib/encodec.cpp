@@ -52,24 +52,13 @@ namespace encodec
     constexpr unsigned  CODEBOOK_SIZE   = 1024;
     constexpr unsigned  CODEBOOK_DIM    = 128;
 
-    struct model_file_header
-    {
-        char magic[8];
-        uint32_t version;
-        uint32_t sample_rate;
-        uint32_t channels;
-        uint32_t max_quantizers;
-        uint32_t flags;
-        uint32_t decoder_floats;
-        uint32_t rvq_floats;
-    };
-
     constexpr uint32_t MODEL_CAUSAL = 1u << 0;
     constexpr uint32_t MODEL_NORMALIZED = 1u << 1;
 
     struct runtime_model
     {
         model_info info;
+        std::vector<float> encoder_weights;
         std::vector<float> decoder_weights;
         std::vector<float> rvq_weights;
     };
@@ -78,19 +67,39 @@ namespace encodec
     {
         std::ifstream input(path, std::ios::binary);
         if (!input) throw std::runtime_error("Cannot open EnCodec model: " + path.string());
-        model_file_header h{};
-        input.read(reinterpret_cast<char*>(&h), sizeof(h));
-        if (!input || std::memcmp(h.magic, "ENCDMOD", 7) != 0 || h.version != 1)
+
+        char magic[8]{};
+        uint32_t version{};
+        input.read(magic, sizeof(magic));
+        input.read(reinterpret_cast<char*>(&version), sizeof(version));
+        if (!input || std::memcmp(magic, "ENCDMOD", 7) != 0 || (version != 1 && version != 2))
             throw std::runtime_error("Unsupported EnCodec model file");
-        if ((h.sample_rate != 24000 && h.sample_rate != 48000) ||
-            (h.channels != 1 && h.channels != 2) || h.max_quantizers == 0)
+
+        uint32_t sample_rate{}, channels{}, max_quantizers{}, flags{};
+        uint32_t encoder_floats{}, decoder_floats{}, rvq_floats{};
+        input.read(reinterpret_cast<char*>(&sample_rate), sizeof(sample_rate));
+        input.read(reinterpret_cast<char*>(&channels), sizeof(channels));
+        input.read(reinterpret_cast<char*>(&max_quantizers), sizeof(max_quantizers));
+        input.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+        if (version == 2)
+            input.read(reinterpret_cast<char*>(&encoder_floats), sizeof(encoder_floats));
+        input.read(reinterpret_cast<char*>(&decoder_floats), sizeof(decoder_floats));
+        input.read(reinterpret_cast<char*>(&rvq_floats), sizeof(rvq_floats));
+        constexpr uint32_t MAX_MODEL_FLOATS = 256u * 1024u * 1024u;
+        if (!input || (sample_rate != 24000 && sample_rate != 48000) ||
+            (channels != 1 && channels != 2) || max_quantizers == 0 ||
+            encoder_floats > MAX_MODEL_FLOATS || decoder_floats > MAX_MODEL_FLOATS ||
+            rvq_floats > MAX_MODEL_FLOATS)
             throw std::runtime_error("Invalid EnCodec model configuration");
 
         runtime_model model;
-        model.info = {h.sample_rate, h.channels, h.max_quantizers,
-                      (h.flags & MODEL_CAUSAL) != 0, (h.flags & MODEL_NORMALIZED) != 0};
-        model.decoder_weights.resize(h.decoder_floats);
-        model.rvq_weights.resize(h.rvq_floats);
+        model.info = {sample_rate, channels, max_quantizers,
+                      (flags & MODEL_CAUSAL) != 0, (flags & MODEL_NORMALIZED) != 0};
+        model.encoder_weights.resize(encoder_floats);
+        model.decoder_weights.resize(decoder_floats);
+        model.rvq_weights.resize(rvq_floats);
+        input.read(reinterpret_cast<char*>(model.encoder_weights.data()),
+                   std::streamsize(model.encoder_weights.size() * sizeof(float)));
         input.read(reinterpret_cast<char*>(model.decoder_weights.data()),
                    std::streamsize(model.decoder_weights.size() * sizeof(float)));
         input.read(reinterpret_cast<char*>(model.rvq_weights.data()),
@@ -422,9 +431,13 @@ namespace encodec
         std::span<float> operator()(std::span<const float> input)
         {
             const size_t p    = pad();
-            const size_t left = causal ? p : p - p/2;
-            const size_t right = p - left;
             const size_t Tin  = input.size() / nin;
+            // Meta's SConv1d pads incomplete strided hops on the right so the
+            // encoder always produces ceil(T / stride) frames. This matters
+            // for the final, shorter ECDC segment.
+            const size_t extra_right = (s - Tin % s) % s;
+            const size_t left = causal ? p : p - p/2;
+            const size_t right = p - left + extra_right;
             const size_t Tinp = Tin+left+right;
             const size_t Tout = (Tinp-k)/s + 1;
 
@@ -677,10 +690,11 @@ namespace encodec
         elu_layer    a1;
         conv         b1;
 
-        encoder_block(size_t c1, size_t c2, size_t s)
-        : b0(c1),
+        encoder_block(size_t c1, size_t c2, size_t s,
+                      bool causal=true, bool normalized=false)
+        : b0(c1, causal, normalized),
           a1(true),
-          b1(c1, c2, s*2, s)
+          b1(c1, c2, s*2, s, causal, normalized)
         {}
 
         auto load_weights(std::span<const float> data) -> std::span<const float>
@@ -728,6 +742,8 @@ namespace encodec
 
     struct encoder::impl
     {
+        runtime_model model;
+        model_info model_info_;
         conv          b0;
         encoder_block b1;
         encoder_block b2;
@@ -737,13 +753,15 @@ namespace encodec
         elu_layer     a6;
         conv          b6;
         rvq           rvq_;
+        std::vector<float> normalized_audio;
 
         impl()
-        : b0(  1,  32, 7),
-          b1( 32,  64, 2),
-          b2( 64, 128, 4),
-          b3(128, 256, 5),
-          b4(256, 512, 8),
+        : model_info_{24000, 1, NLEVELS, true, false},
+          b0(  1,  32, 7),
+          b1( 32,  64, 2, model_info_.causal, model_info_.normalized),
+          b2( 64, 128, 4, model_info_.causal, model_info_.normalized),
+          b3(128, 256, 5, model_info_.causal, model_info_.normalized),
+          b4(256, 512, 8, model_info_.causal, model_info_.normalized),
           b5(512),
           a6(true),
           b6(512, 128, 7)
@@ -759,18 +777,76 @@ namespace encodec
             if (!weights.empty()) throw std::runtime_error("Failed to load encoder weights");
         }
 
-        std::span<const uint8_t> encode(std::span<const float> audio, unsigned int num_quantizers)
+        explicit impl(runtime_model model_)
+        : model{std::move(model_)},
+          model_info_{model.info},
+          b0(model_info_.channels, 32, 7, 1, model_info_.causal, model_info_.normalized),
+          b1( 32,  64, 2, model_info_.causal, model_info_.normalized),
+          b2( 64, 128, 4, model_info_.causal, model_info_.normalized),
+          b3(128, 256, 5, model_info_.causal, model_info_.normalized),
+          b4(256, 512, 8, model_info_.causal, model_info_.normalized),
+          b5(512),
+          a6(true),
+          b6(512, 128, 7, 1, model_info_.causal, model_info_.normalized),
+          rvq_(model.rvq_weights, model_info_.max_quantizers)
         {
-            assert(num_quantizers >= 1 && num_quantizers <= NLEVELS);
+            if (model.encoder_weights.empty())
+                throw std::runtime_error("This model file does not contain encoder weights");
+            auto weights = std::span<const float>{model.encoder_weights};
+            weights = b0.load_weights(weights);
+            weights = b1.load_weights(weights);
+            weights = b2.load_weights(weights);
+            weights = b3.load_weights(weights);
+            weights = b4.load_weights(weights);
+            weights = b5.load_weights(weights);
+            weights = b6.load_weights(weights);
+            if (!weights.empty()) throw std::runtime_error("Unexpected trailing encoder weights");
+            std::vector<float>().swap(model.encoder_weights);
+            std::vector<float>().swap(model.decoder_weights);
+        }
 
-            auto x = b0(audio);
+        encoded_frame encode_frame(std::span<const float> audio, unsigned int num_quantizers)
+        {
+            if (num_quantizers < 1 || num_quantizers > model_info_.max_quantizers)
+                throw std::runtime_error("Invalid number of quantizers");
+            if (audio.empty() || audio.size() % model_info_.channels != 0)
+                throw std::runtime_error("Audio does not contain complete input frames");
+
+            float scale = 1.0f;
+            std::span<const float> encoder_input = audio;
+            if (model_info_.normalized)
+            {
+                const size_t frames = audio.size() / model_info_.channels;
+                double energy = 0.0;
+                for (size_t frame = 0; frame < frames; ++frame)
+                {
+                    float mono = 0.0f;
+                    for (size_t channel = 0; channel < model_info_.channels; ++channel)
+                        mono += audio[frame*model_info_.channels + channel];
+                    mono /= float(model_info_.channels);
+                    energy += double(mono) * double(mono);
+                }
+                scale = float(std::sqrt(energy / double(frames)));
+                const float divisor = scale + 1.0e-8f;
+                normalized_audio.resize(audio.size());
+                for (size_t i = 0; i < audio.size(); ++i) normalized_audio[i] = audio[i] / divisor;
+                encoder_input = normalized_audio;
+            }
+
+            auto x = b0(encoder_input);
             x      = b1(x);
             x      = b2(x);
             x      = b3(x);
             x      = b4(x);
             x      = b5(x);
             x      = b6(a6(x));
-            return rvq_.encode(x, num_quantizers);
+            const size_t code_frames = x.size() / CODEBOOK_DIM;
+            return {rvq_.encode(x, num_quantizers), code_frames, scale};
+        }
+
+        std::span<const uint8_t> encode(std::span<const float> audio, unsigned int num_quantizers)
+        {
+            return encode_frame(audio, num_quantizers).packet;
         }
     };
 
@@ -837,6 +913,7 @@ namespace encodec
             // Layer objects own their decoder tensors after loading. Retaining the
             // serialized copy would waste roughly 28 MiB for every frame worker.
             std::vector<float>().swap(model.decoder_weights);
+            std::vector<float>().swap(model.encoder_weights);
         }
 
         std::span<const float> decode(std::span<const uint8_t> packet, unsigned int num_quantizers,
@@ -860,6 +937,8 @@ namespace encodec
 //----------------------------------------------------------------------------------------------------------------
 
     encoder::encoder() : state{std::make_unique<impl>()} {}
+    encoder::encoder(const std::filesystem::path& model_path)
+    : state{std::make_unique<impl>(load_runtime_model(model_path))} {}
     encoder::~encoder()                          = default;
     encoder::encoder(encoder&& other)            = default;
     encoder& encoder::operator=(encoder&& other) = default;
@@ -868,6 +947,13 @@ namespace encodec
     {
         return state->encode(audio, num_quantizers);
     }
+
+    encoded_frame encoder::encode_frame(std::span<const float> audio, unsigned int num_quantizers)
+    {
+        return state->encode_frame(audio, num_quantizers);
+    }
+
+    model_info encoder::info() const { return state->model_info_; }
 
 //----------------------------------------------------------------------------------------------------------------
 

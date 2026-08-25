@@ -17,6 +17,13 @@ namespace encodec
         bool normalized{};
     };
 
+    struct encoded_frame
+    {
+        std::span<const uint8_t> packet;
+        std::size_t code_frames{};
+        float scale{1.0f};
+    };
+
 //----------------------------------------------------------------------------------------------------------------
 
     unsigned int get_encodec_bps(unsigned int num_quantizers);
@@ -32,11 +39,14 @@ namespace encodec
         
     public:
         encoder();
+        explicit encoder(const std::filesystem::path& model_path);
         ~encoder();
         encoder(encoder&& other);
         encoder& operator=(encoder&& other);
 
         std::span<const uint8_t> encode(std::span<const float> audio, unsigned int num_quantizers);
+        encoded_frame encode_frame(std::span<const float> audio, unsigned int num_quantizers);
+        model_info info() const;
     };
 
 //----------------------------------------------------------------------------------------------------------------

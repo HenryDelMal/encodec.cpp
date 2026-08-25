@@ -1,8 +1,9 @@
-# Dual-model decoder work
+# Dual-model EnCodec work
 
-This branch starts with decoding because the Android application does not need an
-encoder. Keeping the decoder and its weights separate also avoids shipping the
-upstream encoder weights in the APK.
+This branch started with decoding because the Android application does not need an
+encoder. Decoder-only model files remain supported, so the Android APK does not
+need to ship encoder weights. A combined model is available for desktop or
+server-side 48 kHz encoding.
 
 ## Implemented in the first milestone
 
@@ -20,9 +21,15 @@ upstream encoder weights in the APK.
 - A raw-packet diagnostic utility for comparison with Meta's Python decoder.
 - A non-LM ECDC decompressor with per-frame scales, exact code lengths, Meta-style
   overlap-add, Float32 WAV output and optional peak rescaling.
+- A version-2 combined model containing encoder, decoder and shared RVQ weights.
+- A configurable 24/48 kHz encoder graph with stereo input, non-causal padding,
+  GroupNorm and Meta-compatible frame normalization for the 48 kHz model.
+- A non-LM WAV-to-ECDC compressor with 48 kHz segmentation and selectable bitrate.
+- Correct ceil-to-hop padding for partial final encoder frames.
 
-The generated float32 files are approximately 44 MiB for 24 kHz and 36 MiB for
-48 kHz. They are build artifacts and are intentionally not committed.
+The generated 48 kHz float32 files are approximately 36 MiB for decoder-only and
+65 MiB for the combined encoder/decoder model. They are build artifacts and are
+intentionally not committed.
 
 ## Validation status
 
@@ -39,6 +46,12 @@ to 20.30 seconds, three to 18.57 seconds, and four to 17.49 seconds. Two workers
 are the default because additional workers sharply increase aggregate CPU time
 for relatively small wall-time gains. Listening and Android device tests are
 still required.
+
+The 48 kHz encoder completed a native smoke test: a 52,800-frame Float32 stereo
+WAV was encoded at 3 kbps into two non-LM ECDC segments and decoded back to
+exactly 52,800 frames. This validates the combined model, tail-hop padding,
+per-frame scales and ECDC framing; broader interoperability fixtures are still
+desirable.
 
 ## Next milestones
 
