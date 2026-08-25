@@ -174,8 +174,10 @@ struct arguments
     std::string output;
     double bandwidth_kbps{3.0};
     unsigned int threads{1};
-    unsigned int chunk_seconds{30};
-    unsigned int warmup_seconds{1};
+    unsigned int chunk_seconds{};
+    unsigned int warmup_seconds{};
+    bool chunk_seconds_set{};
+    bool warmup_seconds_set{};
 };
 
 arguments parse_arguments(int argc, char** argv)
@@ -192,9 +194,15 @@ arguments parse_arguments(int argc, char** argv)
         else if ((option == "-t" || option == "--threads") && i + 1 < argc)
             args.threads = unsigned(std::stoul(argv[++i]));
         else if (option == "--chunk-seconds" && i + 1 < argc)
+        {
             args.chunk_seconds = unsigned(std::stoul(argv[++i]));
+            args.chunk_seconds_set = true;
+        }
         else if (option == "--warmup-seconds" && i + 1 < argc)
+        {
             args.warmup_seconds = unsigned(std::stoul(argv[++i]));
+            args.warmup_seconds_set = true;
+        }
         else throw std::runtime_error("Unknown or incomplete argument: " + option);
     }
     if (args.model.empty() || args.input.empty() || args.output.empty())
@@ -202,9 +210,9 @@ arguments parse_arguments(int argc, char** argv)
     if (!(args.bandwidth_kbps > 0.0)) throw std::runtime_error("Bandwidth must be positive");
     if (args.threads == 0 || args.threads > 16)
         throw std::runtime_error("Thread count must be between 1 and 16");
-    if (args.chunk_seconds == 0 || args.chunk_seconds > 3600)
+    if (args.chunk_seconds_set && (args.chunk_seconds == 0 || args.chunk_seconds > 3600))
         throw std::runtime_error("Chunk duration must be between 1 and 3600 seconds");
-    if (args.warmup_seconds > 60)
+    if (args.warmup_seconds_set && args.warmup_seconds > 60)
         throw std::runtime_error("Warm-up duration must be between 0 and 60 seconds");
     return args;
 }
@@ -229,11 +237,21 @@ int main(int argc, char** argv)
         uint64_t warmup_length = 0;
         if (info.sample_rate == 24000)
         {
-            segment_length = uint64_t(args.chunk_seconds) * info.sample_rate;
+            const uint64_t duration_seconds =
+                (audio_length + info.sample_rate - 1) / info.sample_rate;
+            const uint64_t chunk_seconds = args.chunk_seconds_set ? args.chunk_seconds :
+                (duration_seconds <= 60 ? std::max<uint64_t>(duration_seconds, 1) : 30);
+            segment_length = chunk_seconds * info.sample_rate;
             segment_length -= segment_length % 320;
             segment_stride = segment_length;
-            warmup_length = uint64_t(args.warmup_seconds) * info.sample_rate;
+            const bool multiple_chunks = audio_length > segment_length;
+            const uint64_t warmup_seconds = args.warmup_seconds_set ? args.warmup_seconds :
+                (multiple_chunks ? 1 : 0);
+            warmup_length = warmup_seconds * info.sample_rate;
             warmup_length -= warmup_length % 320;
+            std::cout << "Chunking: " << chunk_seconds << " s (" << segment_length
+                      << " samples), warm-up: " << warmup_seconds << " s ("
+                      << warmup_length << " samples)\n";
         }
         const double codebook_kbps = (double(info.sample_rate) / 320.0) * 10.0 / 1000.0;
         const unsigned int codebooks = unsigned(std::llround(args.bandwidth_kbps / codebook_kbps));

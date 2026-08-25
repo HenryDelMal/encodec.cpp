@@ -195,21 +195,21 @@ build/encodec_compress \
   --input input-24k-mono.wav \
   --output output.ecdc \
   --bandwidth 3 \
-  --threads 4 \
-  --chunk-seconds 30 \
-  --warmup-seconds 1
+  --threads 4
 ```
 
-Long 24 kHz files are encoded sequentially in bounded-memory chunks. The default
-chunk is 30 seconds, exactly 2,250 codec hops of 320 samples, so intermediate
-boundaries never contain a partial hop. The codes are packed into one continuous
-standard ECDC bitstream; chunks are not encoded concurrently.
+Chunking is automatic. A 24 kHz file of at most 60 seconds is encoded in one
+pass without warm-up. Longer files use sequential 30-second chunks, exactly
+2,250 codec hops of 320 samples, so intermediate boundaries never contain a
+partial hop. The codes are packed into one continuous standard ECDC bitstream;
+chunks are not encoded concurrently.
 
 Because the 24 kHz model is causal and contains LSTMs, each chunk after the first
 is prefixed with one second of source history by default. Those warm-up codes are
 discarded. This substantially reduces state-reset transients without increasing
 the output duration. It is an approximation rather than fully stateful streaming;
 use a larger `--warmup-seconds` value if a source exposes audible boundaries.
+`--chunk-seconds N` and `--warmup-seconds N` override the automatic choices.
 
 Encode 48 kHz stereo:
 
@@ -239,6 +239,14 @@ build/encodec_decompress \
 For decompression, `--threads` means independent ECDC frame workers, not OpenMP
 intra-model threads. One worker uses the least memory. Multiple workers each own
 a decoder and therefore duplicate its working tensors and weights.
+
+Bounded 24 kHz decoding is automatic. Files of at most 60 seconds use one neural
+chunk. For longer files, the decoder targets approximately 80 seconds of
+concurrent neural work and clamps each chunk to 5–30 seconds. For example, eight
+workers select 10-second chunks while four workers select 20-second chunks. All
+durations are converted to samples and aligned to the model's 320-sample codec
+hop. The decoder uses prior codes as warm-up and applies a 10 ms per-channel
+boundary correction that does not remove samples or shorten the timeline.
 
 The decoder preserves 48 kHz normalization scales and performs Meta-style
 overlap-add. `--rescale` lowers the final peak to 0.99 when clipping would occur.
@@ -311,6 +319,8 @@ are therefore not part of the repository test binary.
 - The 24 kHz bounded-memory encoder reconstructs causal state from a configurable
   warm-up window; it does not yet carry exact convolution and LSTM state between
   chunks.
+- The bounded 24 kHz decoder similarly reconstructs state from prior codes and
+  applies boundary correction rather than carrying exact layer state.
 - WAV input is currently loaded into memory even though neural-network working
   tensors are bounded by `--chunk-seconds`.
 - Runtime model files contain Float32 weights and are not committed.

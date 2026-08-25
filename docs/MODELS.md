@@ -89,14 +89,20 @@ kHz model and 48 kHz stereo to the 48 kHz model.
 
 ### Process is killed while encoding a long 24 kHz file
 
-Use a build containing the bounded-memory encoder and keep the default
-`--chunk-seconds 30`. Older revisions passed the complete waveform through the
-network at once and could allocate many gigabytes of intermediate tensors.
+Use a build containing the bounded-memory encoder. It automatically selects a
+30-second chunk for files longer than 60 seconds. Older revisions passed the
+complete waveform through the network at once and could allocate many gigabytes
+of intermediate tensors.
 
 Every non-final 24 kHz chunk is aligned to the 320-sample codec hop. A one-second
 history window warms the causal convolution and LSTM state before each chunk;
 override it with `--warmup-seconds N`. The history codes are discarded and do
 not alter duration or bitrate.
+
+The decoder also selects bounded chunks automatically. Its choice accounts for
+the requested frame-worker count: approximately `80 / threads` seconds, clamped
+to 5–30 seconds. Both CLIs print the selected seconds and aligned sample counts.
+Manual `--chunk-seconds` and `--warmup-seconds` values remain available.
 
 ### Large repository or executable size
 

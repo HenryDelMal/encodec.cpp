@@ -64,6 +64,11 @@ A 43,374,759-frame 24 kHz mono file that was previously killed by macOS complete
 in 35.5 seconds with four threads, 30-second chunks and one second of warm-up
 context. The resulting 3 kbps ECDC file was approximately 662 KiB.
 
+The same file decoded with eight workers in 24.75 seconds using automatic
+10-second decoder chunks. Output contained exactly 43,374,759 frames
+(1,807.281625 seconds). The 24 kHz stitcher uses prior-code warm-up plus a 10 ms
+non-shortening boundary correction.
+
 ## Next milestones
 
 1. Add permanent Python parity fixtures to automated tests.
