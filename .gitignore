@@ -2,3 +2,5 @@
 **/build-*
 **/.vscode
 **/.cache
+models/*.bin
+models/checkpoints/
