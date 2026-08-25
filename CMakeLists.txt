@@ -76,6 +76,9 @@ target_link_libraries(encodec_example PRIVATE encodec::encodec)
 add_executable(encodec_decode_packet src/examples/decode_packet.cpp)
 target_link_libraries(encodec_decode_packet PRIVATE encodec::encodec)
 
+add_executable(encodec_decompress src/examples/decompress_ecdc.cpp)
+target_link_libraries(encodec_decompress PRIVATE encodec::encodec)
+
 # Test
 add_executable(encodec_tests 
   src/tests/doctest.cpp

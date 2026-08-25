@@ -8,8 +8,10 @@ A C++ implementation of Meta's [Encodec](https://audiocraft.metademolab.com/enco
 
 > This branch is an experimental decoder-first fork. It is adding runtime-selectable
 > 24 kHz mono and 48 kHz stereo models for use by the Android EnCodec player. The
-> original 24 kHz API remains available, but the new 48 kHz path is not yet ready
-> for production playback. See [docs/DUAL_MODEL_DECODER.md](docs/DUAL_MODEL_DECODER.md).
+> original 24 kHz API remains available. The 48 kHz decoder and non-LM ECDC CLI
+> are now validated against Meta's Python decoder, but Android integration and
+> device power benchmarks remain experimental. See
+> [docs/DUAL_MODEL_DECODER.md](docs/DUAL_MODEL_DECODER.md).
 
 ## API
 
@@ -38,6 +40,16 @@ python tools/export_decoder_model.py \
   --checkpoint encodec_48khz-7e698e3e.th \
   --sample-rate 48000 \
   --output encodec-decoder-48khz-f32.bin
+```
+
+Decode a non-LM `.ecdc` file, preserving 48 kHz frame scales and overlap-add:
+
+```sh
+encodec_decompress \
+  --model encodec-decoder-48khz-f32.bin \
+  --input input.ecdc \
+  --output output.wav \
+  --rescale
 ```
 
 ## Notes

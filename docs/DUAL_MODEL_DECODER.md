@@ -18,6 +18,8 @@ upstream encoder weights in the APK.
   at 48 kHz.
 - An exact code-frame decode overload so byte padding cannot create a false frame.
 - A raw-packet diagnostic utility for comparison with Meta's Python decoder.
+- A non-LM ECDC decompressor with per-frame scales, exact code lengths, Meta-style
+  overlap-add, Float32 WAV output and optional peak rescaling.
 
 The generated float32 files are approximately 44 MiB for 24 kHz and 36 MiB for
 48 kHz. They are build artifacts and are intentionally not committed.
@@ -25,19 +27,20 @@ The generated float32 files are approximately 44 MiB for 24 kHz and 36 MiB for
 ## Validation status
 
 Both model variants load and produce the expected number of samples. The legacy
-24 kHz tests still pass. Initial parity tests show that the exported 24 kHz model
-matches this repository's compiled decoder weights, but neither path is yet
-sample-accurate with Meta's Python output. The new 48 kHz path has the correct
-shape and strong output correlation, but also needs layer-by-layer parity work.
-It must not be integrated into the Android player until that difference is
-understood.
+24 kHz tests still pass. A 222.16-second official 48 kHz stereo ECDC file decoded
+to exactly 10,663,680 frames. Comparison with Meta's Python CLI output produced
+correlation rounding to 1.0 and approximately 1.8e-5 RMS difference after matching
+gain; that residual is consistent with the reference WAV's Int16 quantization.
+
+The 48 kHz macOS smoke test decoded 222.16 seconds in 34.53 seconds using the
+single-threaded Eigen path. Listening and Android device tests are still required.
 
 ## Next milestones
 
-1. Add layer-level reference vectors and correct numerical differences.
-2. Parse non-LM `.ecdc` framing, per-frame scale values and 48 kHz overlap-add.
-3. Add WAV output and optional decoder-side peak rescaling to the CLI.
-4. Add Android NDK/arm64 build support and verify Eigen NEON vectorization.
-5. Benchmark speed, memory and energy against the current ONNX Runtime decoder on
+1. Add permanent Python parity fixtures to automated tests.
+2. Add Android NDK/arm64 build support and verify Eigen NEON vectorization.
+3. Benchmark speed, memory and energy against the current ONNX Runtime decoder on
    the OnePlus 13 and a lower-range phone.
-6. Consider float16 or quantized weight storage after float32 parity is established.
+4. Add a decoder-only build option so the CLI/APK does not carry legacy compiled
+   encoder and 24 kHz weights.
+5. Consider float16 or quantized weight storage after float32 parity is established.
