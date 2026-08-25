@@ -28,6 +28,34 @@ extern const std::size_t RVQ_SIZE;
 namespace encodec
 {
 
+    struct cpu_thread_state
+    {
+        cpu_thread_state() { Eigen::setNbThreads(1); }
+    };
+
+    cpu_thread_state& cpu_threads()
+    {
+        static cpu_thread_state state;
+        return state;
+    }
+
+    void set_num_threads(unsigned int threads)
+    {
+        if (threads == 0) throw std::runtime_error("Thread count must be positive");
+#if !defined(ENCODEC_HAS_OPENMP)
+        if (threads > 1)
+            throw std::runtime_error("This build does not include OpenMP threading support");
+#endif
+        (void)cpu_threads();
+        Eigen::setNbThreads(int(threads));
+    }
+
+    unsigned int get_num_threads()
+    {
+        (void)cpu_threads();
+        return unsigned(Eigen::nbThreads());
+    }
+
 //----------------------------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------------------------
 // MATH
@@ -807,6 +835,7 @@ namespace encodec
 
         encoded_frame encode_frame(std::span<const float> audio, unsigned int num_quantizers)
         {
+            (void)cpu_threads();
             if (num_quantizers < 1 || num_quantizers > model_info_.max_quantizers)
                 throw std::runtime_error("Invalid number of quantizers");
             if (audio.empty() || audio.size() % model_info_.channels != 0)
@@ -919,6 +948,7 @@ namespace encodec
         std::span<const float> decode(std::span<const uint8_t> packet, unsigned int num_quantizers,
                                       size_t code_frames = 0)
         {
+            (void)cpu_threads();
             if (num_quantizers < 1 || num_quantizers > model_info_.max_quantizers)
                 throw std::runtime_error("Invalid number of quantizers");
 

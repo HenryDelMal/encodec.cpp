@@ -62,8 +62,23 @@ encodec_compress \
   --model encodec-48khz-f32.bin \
   --input input.wav \
   --output output.ecdc \
-  --bandwidth 3
+  --bandwidth 3 \
+  --threads 4
 ```
+
+Encoder threading uses OpenMP inside the neural-network matrix operations and
+works for both 24 kHz and 48 kHz models. The library defaults to one intra-model
+thread; request more explicitly for offline encoding. On macOS with Homebrew:
+
+```sh
+brew install libomp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DOpenMP_ROOT="$(brew --prefix libomp)"
+cmake --build build --target encodec_compress -j4
+```
+
+The Android NDK also provides an OpenMP runtime, but it should remain an explicit
+power/performance choice for the player rather than becoming the decoder default.
 
 Decode a non-LM `.ecdc` file, preserving 48 kHz frame scales and overlap-add:
 

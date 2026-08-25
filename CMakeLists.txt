@@ -25,6 +25,7 @@ CPMAddPackage(
 # Options
 option(ENCODEC_ENABLE_SANITIZERS "Build unit tests with sanitizers" OFF)
 option(ENCODEC_ENABLE_IPO "Enable interprocedural optimization in Release builds" ON)
+option(ENCODEC_ENABLE_OPENMP "Enable intra-model CPU threading with OpenMP" ON)
 
 # Weights
 function(add_zipped_weight_source out_var zip_file output_name)
@@ -70,6 +71,16 @@ target_compile_options(encodec
   PRIVATE $<$<CONFIG:Release>:-ffast-math>)
   
 target_link_libraries(encodec PRIVATE Eigen3::Eigen)
+
+if (ENCODEC_ENABLE_OPENMP)
+  find_package(OpenMP COMPONENTS CXX)
+  if (OpenMP_CXX_FOUND)
+    target_link_libraries(encodec PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_definitions(encodec PRIVATE ENCODEC_HAS_OPENMP=1)
+  else()
+    message(WARNING "OpenMP is unavailable; encoder/decoder intra-model threading is disabled")
+  endif()
+endif()
 
 # The decoder consists mostly of small, fixed neural-network layers spread
 # across this translation unit. Letting the linker optimize across object-file

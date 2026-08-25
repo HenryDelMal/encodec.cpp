@@ -138,6 +138,7 @@ struct arguments
     std::string input;
     std::string output;
     double bandwidth_kbps{3.0};
+    unsigned int threads{1};
 };
 
 arguments parse_arguments(int argc, char** argv)
@@ -151,11 +152,15 @@ arguments parse_arguments(int argc, char** argv)
         else if ((option == "-o" || option == "--output") && i + 1 < argc) args.output = argv[++i];
         else if ((option == "-b" || option == "--bandwidth") && i + 1 < argc)
             args.bandwidth_kbps = std::stod(argv[++i]);
+        else if ((option == "-t" || option == "--threads") && i + 1 < argc)
+            args.threads = unsigned(std::stoul(argv[++i]));
         else throw std::runtime_error("Unknown or incomplete argument: " + option);
     }
     if (args.model.empty() || args.input.empty() || args.output.empty())
-        throw std::runtime_error("Usage: encodec_compress -m MODEL -i INPUT.wav -o OUTPUT.ecdc [-b KBPS]");
+        throw std::runtime_error("Usage: encodec_compress -m MODEL -i INPUT.wav -o OUTPUT.ecdc [-b KBPS] [-t THREADS]");
     if (!(args.bandwidth_kbps > 0.0)) throw std::runtime_error("Bandwidth must be positive");
+    if (args.threads == 0 || args.threads > 16)
+        throw std::runtime_error("Thread count must be between 1 and 16");
     return args;
 }
 } // namespace
@@ -166,6 +171,7 @@ int main(int argc, char** argv)
     {
         const arguments args = parse_arguments(argc, argv);
         const auto started = std::chrono::steady_clock::now();
+        encodec::set_num_threads(args.threads);
         const wav_audio audio = read_wav(args.input);
         encodec::encoder encoder(args.model);
         const auto info = encoder.info();
@@ -208,7 +214,8 @@ int main(int argc, char** argv)
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         std::cout << "Encoded " << audio_length << " frames at " << info.sample_rate << " Hz, "
                   << info.channels << " channels, " << codebooks << " codebooks ("
-                  << codebooks*codebook_kbps << " kbps)\nElapsed: " << elapsed << " s\n";
+                  << codebooks*codebook_kbps << " kbps)\nThreads: " << encodec::get_num_threads()
+                  << "\nElapsed: " << elapsed << " s\n";
     }
     catch (const std::exception& error)
     {

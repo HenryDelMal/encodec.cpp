@@ -28,6 +28,8 @@ namespace encodec
 
     unsigned int get_encodec_bps(unsigned int num_quantizers);
     unsigned int get_encoded_nquantizers(unsigned int bps);
+    void set_num_threads(unsigned int threads);
+    unsigned int get_num_threads();
 
 //----------------------------------------------------------------------------------------------------------------
 

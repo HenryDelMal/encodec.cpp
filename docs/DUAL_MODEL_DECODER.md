@@ -25,6 +25,7 @@ server-side 48 kHz encoding.
 - A configurable 24/48 kHz encoder graph with stereo input, non-causal padding,
   GroupNorm and Meta-compatible frame normalization for the 48 kHz model.
 - A non-LM WAV-to-ECDC compressor with 48 kHz segmentation and selectable bitrate.
+- Optional OpenMP intra-model encoder threading with a safe one-thread default.
 - Correct ceil-to-hop padding for partial final encoder frames.
 
 The generated 48 kHz float32 files are approximately 36 MiB for decoder-only and
@@ -52,6 +53,10 @@ WAV was encoded at 3 kbps into two non-LM ECDC segments and decoded back to
 exactly 52,800 frames. This validates the combined model, tail-hop padding,
 per-frame scales and ECDC framing; broader interoperability fixtures are still
 desirable.
+
+On a 60-second 24 kHz mono fixture, four OpenMP threads reduced native encoding
+wall time from 5.16 seconds to 2.57 seconds. The one-thread and four-thread ECDC
+outputs were byte-identical.
 
 ## Next milestones
 
