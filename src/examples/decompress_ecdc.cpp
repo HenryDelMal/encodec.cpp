@@ -1,6 +1,7 @@
 #include <encodec.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -9,9 +10,12 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <regex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace
@@ -116,6 +120,7 @@ struct arguments
     std::string input;
     std::string output;
     bool rescale{};
+    unsigned int threads{2};
 };
 
 arguments parse_arguments(int argc, char** argv)
@@ -127,13 +132,27 @@ arguments parse_arguments(int argc, char** argv)
         if ((option == "-m" || option == "--model") && i + 1 < argc) args.model = argv[++i];
         else if ((option == "-i" || option == "--input") && i + 1 < argc) args.input = argv[++i];
         else if ((option == "-o" || option == "--output") && i + 1 < argc) args.output = argv[++i];
+        else if ((option == "-t" || option == "--threads") && i + 1 < argc)
+            args.threads = unsigned(std::stoul(argv[++i]));
         else if (option == "-r" || option == "--rescale") args.rescale = true;
         else throw std::runtime_error("Unknown or incomplete argument: " + option);
     }
     if (args.model.empty() || args.input.empty() || args.output.empty())
-        throw std::runtime_error("Usage: encodec_decompress -m MODEL -i INPUT.ecdc -o OUTPUT.wav [--rescale]");
+        throw std::runtime_error("Usage: encodec_decompress -m MODEL -i INPUT.ecdc -o OUTPUT.wav [--threads N] [--rescale]");
+    if (args.threads == 0 || args.threads > 16)
+        throw std::runtime_error("Thread count must be between 1 and 16");
     return args;
 }
+
+struct compressed_frame
+{
+    uint64_t offset{};
+    uint64_t wanted{};
+    size_t code_frames{};
+    float scale{1};
+    std::vector<uint8_t> packet;
+    std::vector<float> decoded;
+};
 } // namespace
 
 int main(int argc, char** argv)
@@ -157,36 +176,85 @@ int main(int argc, char** argv)
         const uint64_t segment_length = info.sample_rate == 48000 ? 48000 : metadata.audio_length;
         const uint64_t segment_stride = info.sample_rate == 48000 ? 47520 : metadata.audio_length;
         const uint64_t frame_rate = (info.sample_rate + 319) / 320;
-        std::vector<float> output(metadata.audio_length * info.channels, 0.0f);
-        std::vector<float> weights(metadata.audio_length, 0.0f);
-        size_t frame_index = 0;
-
-        for (uint64_t offset = 0; offset < metadata.audio_length; offset += segment_stride, ++frame_index)
+        std::vector<compressed_frame> frames;
+        for (uint64_t offset = 0; offset < metadata.audio_length; offset += segment_stride)
         {
             const uint64_t wanted = std::min(segment_length, metadata.audio_length - offset);
             const size_t code_frames = size_t((wanted * frame_rate + info.sample_rate - 1) / info.sample_rate);
             const size_t code_count = code_frames * metadata.codebooks;
             const size_t packet_bytes = (code_count * 10 + 7) / 8;
-            const float scale = info.sample_rate == 48000 ? read_be_float(input) : 1.0f;
-            std::vector<uint8_t> packet(packet_bytes);
-            input.read(reinterpret_cast<char*>(packet.data()), std::streamsize(packet.size()));
-            if (!input) throw std::runtime_error("ECDC ended while reading frame " + std::to_string(frame_index));
+            compressed_frame& frame = frames.emplace_back();
+            frame.offset = offset;
+            frame.wanted = wanted;
+            frame.code_frames = code_frames;
+            frame.scale = info.sample_rate == 48000 ? read_be_float(input) : 1.0f;
+            frame.packet.resize(packet_bytes);
+            input.read(reinterpret_cast<char*>(frame.packet.data()), std::streamsize(frame.packet.size()));
+            if (!input) throw std::runtime_error("ECDC ended while reading frame " + std::to_string(frames.size() - 1));
+        }
 
-            const auto decoded = decoder.decode(packet, metadata.codebooks, code_frames);
-            const size_t decoded_frames = decoded.size() / info.channels;
-            const size_t available = std::min<size_t>(wanted, decoded_frames);
+        const unsigned int worker_count = std::min<unsigned int>(args.threads, unsigned(frames.size()));
+        std::vector<std::unique_ptr<encodec::decoder>> decoders;
+        decoders.reserve(worker_count);
+        decoders.push_back(std::make_unique<encodec::decoder>(std::move(decoder)));
+        for (unsigned int worker = 1; worker < worker_count; ++worker)
+            decoders.push_back(std::make_unique<encodec::decoder>(args.model));
+
+        std::atomic_size_t next_frame{0};
+        std::atomic_size_t completed{0};
+        std::exception_ptr worker_error;
+        std::mutex error_mutex;
+        auto decode_frames = [&](unsigned int worker)
+        {
+            try
+            {
+                while (true)
+                {
+                    const size_t index = next_frame.fetch_add(1);
+                    if (index >= frames.size()) break;
+                    compressed_frame& frame = frames[index];
+                    const auto samples = decoders[worker]->decode(
+                        frame.packet, metadata.codebooks, frame.code_frames);
+                    frame.decoded.assign(samples.begin(), samples.end());
+                    for (float& sample : frame.decoded) sample *= frame.scale;
+                    const size_t done = completed.fetch_add(1) + 1;
+                    if (worker == 0 || done == frames.size())
+                        std::cerr << "\rDecoded frame " << done << '/' << frames.size() << std::flush;
+                }
+            }
+            catch (...)
+            {
+                std::lock_guard lock(error_mutex);
+                if (!worker_error) worker_error = std::current_exception();
+                next_frame = frames.size();
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count > 0 ? worker_count - 1 : 0);
+        for (unsigned int worker = 1; worker < worker_count; ++worker)
+            workers.emplace_back(decode_frames, worker);
+        decode_frames(0);
+        for (auto& worker : workers) worker.join();
+        if (worker_error) std::rethrow_exception(worker_error);
+        std::cerr << '\n';
+
+        std::vector<float> output(metadata.audio_length * info.channels, 0.0f);
+        std::vector<float> weights(metadata.audio_length, 0.0f);
+        for (const compressed_frame& frame : frames)
+        {
+            const size_t decoded_frames = frame.decoded.size() / info.channels;
+            const size_t available = std::min<size_t>(frame.wanted, decoded_frames);
             for (size_t i = 0; i < available; ++i)
             {
                 const float t = float(i + 1) / float(segment_length + 1);
                 const float weight = 0.5f - std::fabs(t - 0.5f);
-                weights[offset + i] += weight;
+                weights[frame.offset + i] += weight;
                 for (size_t channel = 0; channel < info.channels; ++channel)
-                    output[(offset + i)*info.channels + channel] +=
-                        decoded[i*info.channels + channel] * scale * weight;
+                    output[(frame.offset + i)*info.channels + channel] +=
+                        frame.decoded[i*info.channels + channel] * weight;
             }
-            std::cerr << "\rDecoded frame " << frame_index + 1 << std::flush;
         }
-        std::cerr << '\n';
         for (size_t i = 0; i < metadata.audio_length; ++i)
             if (weights[i] > 0)
                 for (size_t channel = 0; channel < info.channels; ++channel)
@@ -208,7 +276,7 @@ int main(int argc, char** argv)
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         std::cout << "Decoded " << metadata.audio_length << " frames at " << info.sample_rate
                   << " Hz, " << info.channels << " channels, " << metadata.codebooks << " codebooks\n"
-                  << "Peak: " << peak << "\nElapsed: " << elapsed << " s\n";
+                  << "Workers: " << worker_count << "\nPeak: " << peak << "\nElapsed: " << elapsed << " s\n";
     }
     catch (const std::exception& error)
     {

@@ -49,8 +49,14 @@ encodec_decompress \
   --model encodec-decoder-48khz-f32.bin \
   --input input.ecdc \
   --output output.wav \
+  --threads 2 \
   --rescale
 ```
+
+The ECDC CLI defaults to two independent frame workers. Use `--threads 1` for
+the lowest CPU and memory usage. More than two workers can reduce latency on a
+desktop, but has diminishing returns and is not recommended as an Android
+default without device power measurements.
 
 ## Notes
 

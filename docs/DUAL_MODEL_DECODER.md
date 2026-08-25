@@ -33,7 +33,12 @@ correlation rounding to 1.0 and approximately 1.8e-5 RMS difference after matchi
 gain; that residual is consistent with the reference WAV's Int16 quantization.
 
 The 48 kHz macOS smoke test decoded 222.16 seconds in 34.53 seconds using the
-single-threaded Eigen path. Listening and Android device tests are still required.
+single-threaded Eigen path. Independent frame workers produced byte-identical
+output at every tested thread count. On the test Mac, two workers reduced this
+to 20.30 seconds, three to 18.57 seconds, and four to 17.49 seconds. Two workers
+are the default because additional workers sharply increase aggregate CPU time
+for relatively small wall-time gains. Listening and Android device tests are
+still required.
 
 ## Next milestones
 

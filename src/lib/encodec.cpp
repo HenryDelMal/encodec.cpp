@@ -510,7 +510,10 @@ namespace encodec
                 for (size_t kk{0}; kk < k; ++kk)
                 {
                     const size_t to = t*s + kk;
-                    out.row(to) += patches.block(t, kk * nout, 1, nout);
+                    float* destination = out.data() + to*nout;
+                    const float* source = patches.data() + (t*k + kk)*nout;
+                    for (size_t channel{0}; channel < nout; ++channel)
+                        destination[channel] += source[channel];
                 }
             }
 
@@ -831,6 +834,9 @@ namespace encodec
             weights = b5.load_weights(weights);
             weights = b6.load_weights(weights);
             if (!weights.empty()) throw std::runtime_error("Unexpected trailing decoder weights");
+            // Layer objects own their decoder tensors after loading. Retaining the
+            // serialized copy would waste roughly 28 MiB for every frame worker.
+            std::vector<float>().swap(model.decoder_weights);
         }
 
         std::span<const float> decode(std::span<const uint8_t> packet, unsigned int num_quantizers,
