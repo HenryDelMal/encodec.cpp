@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Export an official Meta EnCodec checkpoint for the Eigen decoder runtime."""
+
+import argparse
+import struct
+from pathlib import Path
+
+import torch
+
+
+MAGIC = b"ENCDMOD\0"
+VERSION = 1
+FLAG_CAUSAL = 1
+FLAG_NORMALIZED = 2
+
+
+def tensor(state, name):
+    return state[name].detach().cpu().float().contiguous()
+
+
+def convolution(state, prefix, transpose, normalized):
+    weight_name = prefix + ".weight"
+    if weight_name in state:
+        weight = tensor(state, weight_name)
+    else:
+        weight = torch._weight_norm(
+            tensor(state, prefix + ".weight_v"),
+            tensor(state, prefix + ".weight_g"), dim=0)
+    # Eigen consumes [out, kernel, in] for Conv1d and [in, kernel, out]
+    # for ConvTranspose1d, while PyTorch stores the kernel last.
+    yield weight.permute(0, 2, 1).contiguous().flatten()
+    yield tensor(state, prefix + ".bias").flatten()
+    if normalized:
+        norm_prefix = prefix.rsplit(".", 1)[0] + ".norm"
+        yield tensor(state, norm_prefix + ".weight").flatten()
+        yield tensor(state, norm_prefix + ".bias").flatten()
+
+
+def decoder_tensors(state, normalized):
+    yield from convolution(state, "decoder.model.0.conv.conv", False, normalized)
+    for layer in range(2):
+        prefix = f"decoder.model.1.lstm."
+        for item in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
+            yield tensor(state, f"{prefix}{item}_l{layer}").flatten()
+
+    for transposed, residual in ((3, 4), (6, 7), (9, 10), (12, 13)):
+        yield from convolution(state, f"decoder.model.{transposed}.convtr.convtr", True, normalized)
+        yield from convolution(state, f"decoder.model.{residual}.block.1.conv.conv", False, normalized)
+        yield from convolution(state, f"decoder.model.{residual}.block.3.conv.conv", False, normalized)
+        yield from convolution(state, f"decoder.model.{residual}.shortcut.conv.conv", False, normalized)
+    yield from convolution(state, "decoder.model.15.conv.conv", False, normalized)
+
+
+def export(checkpoint, output, sample_rate):
+    state = torch.load(checkpoint, map_location="cpu")
+    if sample_rate == 24000:
+        channels, max_quantizers, flags = 1, 32, FLAG_CAUSAL
+    else:
+        channels, max_quantizers, flags = 2, 16, FLAG_NORMALIZED
+
+    decoder = torch.cat(list(decoder_tensors(state, bool(flags & FLAG_NORMALIZED))))
+    rvq = torch.cat([
+        tensor(state, f"quantizer.vq.layers.{level}._codebook.embed").flatten()
+        for level in range(max_quantizers)
+    ])
+    header = struct.pack("<8s7I", MAGIC, VERSION, sample_rate, channels,
+                         max_quantizers, flags, decoder.numel(), rvq.numel())
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("wb") as stream:
+        stream.write(header)
+        stream.write(decoder.numpy().tobytes())
+        stream.write(rvq.numpy().tobytes())
+    print(f"Wrote {output} ({output.stat().st_size / 1024 / 1024:.1f} MiB)")
+    print(f"  {sample_rate} Hz, {channels} channel(s), {max_quantizers} codebooks")
+    print(f"  decoder={decoder.numel()} floats, rvq={rvq.numel()} floats")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--sample-rate", type=int, choices=(24000, 48000), required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    export(args.checkpoint, args.output, args.sample_rate)
+
+
+if __name__ == "__main__":
+    main()

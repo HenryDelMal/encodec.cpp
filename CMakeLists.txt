@@ -62,6 +62,7 @@ target_include_directories(encodec
 
 target_compile_options(encodec 
   PRIVATE $<${IS_NOT_MSVC}:-Wall -Wextra -Wpedantic -Werror>
+  PRIVATE $<$<CXX_COMPILER_ID:AppleClang>:-Wno-nan-infinity-disabled>
   PRIVATE $<$<BOOL:${AVX_FOUND}>:${AVX_CFLAGS}>
   PRIVATE $<$<BOOL:${NEON_FOUND}>:${NEON_CFLAGS}>
   PRIVATE $<$<CONFIG:Release>:-ffast-math>)
@@ -71,6 +72,9 @@ target_link_libraries(encodec PRIVATE Eigen3::Eigen)
 # Example
 add_executable(encodec_example src/examples/main.cpp)
 target_link_libraries(encodec_example PRIVATE encodec::encodec)
+
+add_executable(encodec_decode_packet src/examples/decode_packet.cpp)
+target_link_libraries(encodec_decode_packet PRIVATE encodec::encodec)
 
 # Test
 add_executable(encodec_tests 

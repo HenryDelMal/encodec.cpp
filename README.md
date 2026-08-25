@@ -6,6 +6,11 @@
 
 A C++ implementation of Meta's [Encodec](https://audiocraft.metademolab.com/encodec.html) using [Eigen](https://gitlab.com/libeigen/eigen).
 
+> This branch is an experimental decoder-first fork. It is adding runtime-selectable
+> 24 kHz mono and 48 kHz stereo models for use by the Android EnCodec player. The
+> original 24 kHz API remains available, but the new 48 kHz path is not yet ready
+> for production playback. See [docs/DUAL_MODEL_DECODER.md](docs/DUAL_MODEL_DECODER.md).
+
 ## API
 
 ```cpp
@@ -16,6 +21,23 @@ float audio[24000];
 size_t bps = 24000; // 12000, 6000 or 3000
 std::span<const uint8_t> packet = enc.encode(audio, bps);
 std::span<const float>   audio2 = dec.decode(packet, bps);
+```
+
+The experimental runtime-model API is:
+
+```cpp
+encodec::decoder dec("encodec-decoder-48khz-f32.bin");
+auto info = dec.info();
+auto audio = dec.decode(packet, 2, 150); // exact code-frame count avoids padding ambiguity
+```
+
+Export a decoder-only model from an official Meta checkpoint:
+
+```sh
+python tools/export_decoder_model.py \
+  --checkpoint encodec_48khz-7e698e3e.th \
+  --sample-rate 48000 \
+  --output encodec-decoder-48khz-f32.bin
 ```
 
 ## Notes

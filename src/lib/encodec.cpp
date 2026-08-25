@@ -1,4 +1,8 @@
 #include <cassert>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
 #include <vector>
 #include <Eigen/Dense>
 #include "encodec.h"
@@ -47,6 +51,53 @@ namespace encodec
     constexpr unsigned  NLEVELS         = 32;
     constexpr unsigned  CODEBOOK_SIZE   = 1024;
     constexpr unsigned  CODEBOOK_DIM    = 128;
+
+    struct model_file_header
+    {
+        char magic[8];
+        uint32_t version;
+        uint32_t sample_rate;
+        uint32_t channels;
+        uint32_t max_quantizers;
+        uint32_t flags;
+        uint32_t decoder_floats;
+        uint32_t rvq_floats;
+    };
+
+    constexpr uint32_t MODEL_CAUSAL = 1u << 0;
+    constexpr uint32_t MODEL_NORMALIZED = 1u << 1;
+
+    struct runtime_model
+    {
+        model_info info;
+        std::vector<float> decoder_weights;
+        std::vector<float> rvq_weights;
+    };
+
+    runtime_model load_runtime_model(const std::filesystem::path& path)
+    {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) throw std::runtime_error("Cannot open EnCodec model: " + path.string());
+        model_file_header h{};
+        input.read(reinterpret_cast<char*>(&h), sizeof(h));
+        if (!input || std::memcmp(h.magic, "ENCDMOD", 7) != 0 || h.version != 1)
+            throw std::runtime_error("Unsupported EnCodec model file");
+        if ((h.sample_rate != 24000 && h.sample_rate != 48000) ||
+            (h.channels != 1 && h.channels != 2) || h.max_quantizers == 0)
+            throw std::runtime_error("Invalid EnCodec model configuration");
+
+        runtime_model model;
+        model.info = {h.sample_rate, h.channels, h.max_quantizers,
+                      (h.flags & MODEL_CAUSAL) != 0, (h.flags & MODEL_NORMALIZED) != 0};
+        model.decoder_weights.resize(h.decoder_floats);
+        model.rvq_weights.resize(h.rvq_floats);
+        input.read(reinterpret_cast<char*>(model.decoder_weights.data()),
+                   std::streamsize(model.decoder_weights.size() * sizeof(float)));
+        input.read(reinterpret_cast<char*>(model.rvq_weights.data()),
+                   std::streamsize(model.rvq_weights.size() * sizeof(float)));
+        if (!input) throw std::runtime_error("Truncated EnCodec model file");
+        return model;
+    }
 
 //----------------------------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------------------------
@@ -121,25 +172,29 @@ namespace encodec
 
 //----------------------------------------------------------------------------------------------------------------
 
-    auto codebook(size_t l)
-    {
-        return Eigen::Map<const MatrixXf>(&RVQ_WEIGHTS[l*CODEBOOK_SIZE*CODEBOOK_DIM], CODEBOOK_SIZE, CODEBOOK_DIM);
-    }
-    
-//----------------------------------------------------------------------------------------------------------------
-
     struct rvq
     {
-        VectorXf Cnorms[NLEVELS];
+        std::span<const float> weights;
+        size_t max_levels;
+        std::vector<VectorXf> Cnorms;
         MatrixXf dists;
         std::vector<uint16_t> codes;
         std::vector<uint8_t>  codes_packed;
         std::vector<float>    feats;
 
-        rvq()
+        rvq(std::span<const float> weights_ = {RVQ_WEIGHTS, RVQ_SIZE}, size_t max_levels_ = NLEVELS)
+        : weights{weights_}, max_levels{max_levels_}, Cnorms(max_levels)
         {
-            for (size_t l{0} ; l < NLEVELS ; ++l)
+            if (weights.size() != max_levels * CODEBOOK_SIZE * CODEBOOK_DIM)
+                throw std::runtime_error("Invalid RVQ weight count");
+            for (size_t l{0} ; l < max_levels ; ++l)
                 Cnorms[l] = codebook(l).rowwise().squaredNorm();
+        }
+
+        Eigen::Map<const MatrixXf> codebook(size_t l) const
+        {
+            return Eigen::Map<const MatrixXf>(weights.data() + l*CODEBOOK_SIZE*CODEBOOK_DIM,
+                                               CODEBOOK_SIZE, CODEBOOK_DIM);
         }
 
         std::span<const uint8_t> encode(std::span<float> feats, size_t nlevels)
@@ -171,11 +226,13 @@ namespace encodec
             return codes_packed;
         }
 
-        std::span<float> decode(std::span<const uint8_t> codes_packed, size_t nlevels)
+        std::span<float> decode(std::span<const uint8_t> codes_packed, size_t nlevels, size_t code_frames = 0)
         {
             // Unpack bits
-            const size_t ncodes = (codes_packed.size()*8)/10;
-            const size_t T      = ncodes/nlevels;
+            const size_t available_codes = (codes_packed.size()*8)/10;
+            const size_t T = code_frames ? code_frames : available_codes/nlevels;
+            const size_t ncodes = T*nlevels;
+            if (ncodes > available_codes) throw std::runtime_error("Packet is shorter than its code-frame count");
             codes.resize(ncodes);
             feats.resize(T*CODEBOOK_DIM);
             unpack_bits(codes_packed, codes);
@@ -244,6 +301,40 @@ namespace encodec
     };
 
 //----------------------------------------------------------------------------------------------------------------
+
+    struct group_norm
+    {
+        bool enabled{};
+        VectorXf weight;
+        VectorXf bias;
+
+        group_norm(size_t channels, bool enabled_)
+        : enabled{enabled_}, weight(channels), bias(channels) {}
+
+        auto load_weights(std::span<const float> data) -> std::span<const float>
+        {
+            if (!enabled) return data;
+            const size_t count = size_t(weight.size() + bias.size());
+            if (data.size() < count) throw std::runtime_error("Not enough data in GroupNorm weights");
+            weight = Eigen::Map<const VectorXf>(data.data(), weight.size());
+            bias = Eigen::Map<const VectorXf>(data.data() + weight.size(), bias.size());
+            return data.subspan(count);
+        }
+
+        void apply(std::span<float> values)
+        {
+            if (!enabled || values.empty()) return;
+            const size_t channels = size_t(weight.size());
+            auto x = Eigen::Map<MatrixXf>(values.data(), values.size()/channels, channels);
+            const float mean = x.mean();
+            const float variance = (x.array() - mean).square().mean();
+            x.array() = (x.array() - mean) / std::sqrt(variance + 1.0e-5f);
+            x.array().rowwise() *= weight.transpose().array();
+            x.array().rowwise() += bias.transpose().array();
+        }
+    };
+
+//----------------------------------------------------------------------------------------------------------------
 //----------------------------------------------------------------------------------------------------------------
 // NN
 //----------------------------------------------------------------------------------------------------------------
@@ -254,10 +345,12 @@ namespace encodec
         MatrixXf w;
         VectorXf b;
         MatrixXf out;
+        group_norm norm;
 
-        linear(size_t nin_, size_t nout_)
+        linear(size_t nin_, size_t nout_, bool normalized = false)
         : w(nout_, nin_),
-          b(nout_)
+          b(nout_),
+          norm(nout_, normalized)
         {
         }
 
@@ -269,7 +362,7 @@ namespace encodec
             auto b_ = Eigen::Map<const VectorXf>(data.subspan(off, b.size()).data(), nout());        off += b.size();
             w       = w_;
             b       = b_;
-            return data.subspan(off);
+            return norm.load_weights(data.subspan(off));
         }
 
         size_t nin()  {return w.cols();}
@@ -281,7 +374,9 @@ namespace encodec
             auto x = Eigen::Map<const MatrixXf>(input.data(), Tin, nin());
             out.noalias() = x * w.transpose() ;
             out.rowwise() += b.transpose();
-            return std::span<float>{out.data(), static_cast<size_t>(out.size())};
+            std::span<float> result{out.data(), static_cast<size_t>(out.size())};
+            norm.apply(result);
+            return result;
         }
     };
 
@@ -298,14 +393,19 @@ namespace encodec
         VectorXf b;         // shape [nout]
         MatrixXf patches;   // shape [Tout, k*nin]
         MatrixXf out;       // [Tout_padded, nout]
+        bool causal;
+        group_norm norm;
 
-        conv(size_t nin_, size_t nout_, size_t k_, size_t s_=1)
+        conv(size_t nin_, size_t nout_, size_t k_, size_t s_=1,
+             bool causal_=true, bool normalized=false)
         : nin{nin_}, 
           nout{nout_}, 
           k{k_}, 
           s{s_}, 
           w(nout, k*nin),
-          b(nout)
+          b(nout),
+          causal{causal_},
+          norm(nout_, normalized)
         {}
 
         auto load_weights(std::span<const float> data) -> std::span<const float>
@@ -316,37 +416,40 @@ namespace encodec
             auto b_ = Eigen::Map<const VectorXf>(data.subspan(off, b.size()).data(), nout);        off += b.size();
             w       = w_;
             b       = b_;
-            return data.subspan(off);
+            return norm.load_weights(data.subspan(off));
         }
 
         std::span<float> operator()(std::span<const float> input)
         {
             const size_t p    = pad();
+            const size_t left = causal ? p : p - p/2;
+            const size_t right = p - left;
             const size_t Tin  = input.size() / nin;
-            const size_t Tinp = Tin+p;
+            const size_t Tinp = Tin+left+right;
             const size_t Tout = (Tinp-k)/s + 1;
 
             patches.resize(Tout, k*nin);
 
             // im2col : patches[j, :] = padded_input[j*s : j*s+k, :]
-            size_t i{0};
-            for (; (i*s) < p ; ++i)
+            auto reflected = [Tin](long index) -> size_t
             {
-                for (size_t kk = 0; kk < k; ++kk)
+                while (index < 0 || index >= long(Tin))
+                    index = index < 0 ? -index : 2*long(Tin)-2-index;
+                return size_t(index);
+            };
+            for (size_t i{0}; i < Tout; ++i)
+                for (size_t kk{0}; kk < k; ++kk)
                 {
-                    const size_t tp = i*s + kk;
-                    const size_t ti = tp < p ? p - tp : tp - p;
-                    std::copy_n(input.data()+ti*nin,nin,patches.data()+(i*k+kk)*nin);
+                    const auto ti = reflected(long(i*s + kk) - long(left));
+                    std::copy_n(input.data()+ti*nin, nin, patches.data()+(i*k+kk)*nin);
                 }
-            }
-            for (; i < Tout ; ++i)
-                std::copy_n(input.data()+(i*s-p)*nin,k*nin,patches.data()+i*k*nin);
 
             // GEMM
             out.noalias() = patches * w.transpose();
             out.rowwise() += b.transpose();
-
-            return std::span<float>{out.data(), (size_t)out.size()};
+            std::span<float> result{out.data(), (size_t)out.size()};
+            norm.apply(result);
+            return result;
         }
     };
 
@@ -363,14 +466,19 @@ namespace encodec
         VectorXf b;         // [nout]
         MatrixXf patches;   // [Tin, k*nout]
         MatrixXf out;       // [Tout_padded, nout]
+        bool causal;
+        group_norm norm;
 
-        conv_transpose(size_t nin_, size_t nout_, size_t k_, size_t s_ = 1)
+        conv_transpose(size_t nin_, size_t nout_, size_t k_, size_t s_ = 1,
+                       bool causal_=true, bool normalized=false)
         : nin{nin_}, 
           nout{nout_}, 
           k{k_}, 
           s{s_}, 
           w(nin,k*nout),
-          b(nout)
+          b(nout),
+          causal{causal_},
+          norm(nout_, normalized)
         {}
 
         auto load_weights(std::span<const float> data) -> std::span<const float>
@@ -381,7 +489,7 @@ namespace encodec
             auto b_ = Eigen::Map<const VectorXf>(data.subspan(off, b.size()).data(), nout);        off += b.size();
             w       = w_;
             b       = b_;
-            return data.subspan(off);
+            return norm.load_weights(data.subspan(off));
         }
 
         std::span<float> operator()(std::span<const float> input)
@@ -408,8 +516,10 @@ namespace encodec
 
             // Add bias
             out.rowwise() += b.transpose();
-
-            return std::span<float>{out.data(), Tout*nout};
+            std::span<float> padded{out.data(), size_t(out.size())};
+            norm.apply(padded);
+            const size_t left = causal ? 0 : p - p/2;
+            return std::span<float>{out.data() + left*nout, Tout*nout};
         }
     };
 
@@ -531,12 +641,12 @@ namespace encodec
         linear      b1;
         linear      b2;
 
-        resnet_block(size_t c)
+        resnet_block(size_t c, bool causal=true, bool normalized=false)
         : a0(false),
           a1(true),
-          b0(c,   c/2, 3),
-          b1(c/2, c),
-          b2(c,   c)
+          b0(c,   c/2, 3, 1, causal, normalized),
+          b1(c/2, c, normalized),
+          b2(c,   c, normalized)
         {}
 
         auto load_weights(std::span<const float> data) -> std::span<const float>
@@ -591,10 +701,11 @@ namespace encodec
         conv_transpose  b0;
         resnet_block    b1;
 
-        decoder_block(size_t c1, size_t c2, size_t s)
+        decoder_block(size_t c1, size_t c2, size_t s,
+                      bool causal=true, bool normalized=false)
         : a0(true),
-          b0(c1, c2, s*2, s),
-          b1(c2)
+          b0(c1, c2, s*2, s, causal, normalized),
+          b1(c2, causal, normalized)
         {}
 
         auto load_weights(std::span<const float> data) -> std::span<const float>
@@ -664,6 +775,8 @@ namespace encodec
 
     struct decoder::impl
     {
+        runtime_model model;
+        model_info model_info_;
         conv          b0;
         encodec_lstm  b1;
         decoder_block b2;
@@ -675,7 +788,8 @@ namespace encodec
         rvq           rvq_;
 
         impl()
-        : b0(128, 512, 7),
+        : model_info_{24000, 1, NLEVELS, true, false},
+          b0(128, 512, 7),
           b1(512),
           b2(512, 256, 8),
           b3(256, 128, 5),
@@ -695,11 +809,37 @@ namespace encodec
             if (!weights.empty()) throw std::runtime_error("Failed to load decoder weights");
         }
 
-        std::span<const float> decode(std::span<const uint8_t> packet, unsigned int num_quantizers)
+        explicit impl(runtime_model model_)
+        : model{std::move(model_)},
+          model_info_{model.info},
+          b0(128, 512, 7, 1, model_info_.causal, model_info_.normalized),
+          b1(512),
+          b2(512, 256, 8, model_info_.causal, model_info_.normalized),
+          b3(256, 128, 5, model_info_.causal, model_info_.normalized),
+          b4(128,  64, 4, model_info_.causal, model_info_.normalized),
+          b5( 64,  32, 2, model_info_.causal, model_info_.normalized),
+          a6(true),
+          b6( 32, model_info_.channels, 7, 1, model_info_.causal, model_info_.normalized),
+          rvq_(model.rvq_weights, model_info_.max_quantizers)
         {
-            assert(num_quantizers >= 1 && num_quantizers <= NLEVELS);
+            auto weights = std::span<const float>{model.decoder_weights};
+            weights = b0.load_weights(weights);
+            weights = b1.load_weights(weights);
+            weights = b2.load_weights(weights);
+            weights = b3.load_weights(weights);
+            weights = b4.load_weights(weights);
+            weights = b5.load_weights(weights);
+            weights = b6.load_weights(weights);
+            if (!weights.empty()) throw std::runtime_error("Unexpected trailing decoder weights");
+        }
 
-            auto x  = rvq_.decode(packet, num_quantizers);
+        std::span<const float> decode(std::span<const uint8_t> packet, unsigned int num_quantizers,
+                                      size_t code_frames = 0)
+        {
+            if (num_quantizers < 1 || num_quantizers > model_info_.max_quantizers)
+                throw std::runtime_error("Invalid number of quantizers");
+
+            auto x  = rvq_.decode(packet, num_quantizers, code_frames);
             x       = b0(x);
             x       = b1(x);
             x       = b2(x);
@@ -726,6 +866,8 @@ namespace encodec
 //----------------------------------------------------------------------------------------------------------------
 
     decoder::decoder() : state{std::make_unique<impl>()} {}
+    decoder::decoder(const std::filesystem::path& model_path)
+    : state{std::make_unique<impl>(load_runtime_model(model_path))} {}
     decoder::~decoder()                          = default;
     decoder::decoder(decoder&& other)            = default;
     decoder& decoder::operator=(decoder&& other) = default;
@@ -734,6 +876,15 @@ namespace encodec
     {
         return state->decode(packet, num_quantizers);
     }
+
+    std::span<const float> decoder::decode(std::span<const uint8_t> packet,
+                                           unsigned int num_quantizers,
+                                           std::size_t code_frames)
+    {
+        return state->decode(packet, num_quantizers, code_frames);
+    }
+
+    model_info decoder::info() const { return state->model_info_; }
 
 //----------------------------------------------------------------------------------------------------------------
 
