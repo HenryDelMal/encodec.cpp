@@ -12,6 +12,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 set(CPM_SOURCE_CACHE ${CMAKE_SOURCE_DIR}/.cache/cpm CACHE PATH "Directory to cache CPM packages" FORCE)
 include(cmake/CPM.cmake)
 include(CMakeDependentOption)
+include(CheckIPOSupported)
 find_package(AVX)
 find_package(NEON)
 
@@ -23,6 +24,7 @@ CPMAddPackage(
 
 # Options
 option(ENCODEC_ENABLE_SANITIZERS "Build unit tests with sanitizers" OFF)
+option(ENCODEC_ENABLE_IPO "Enable interprocedural optimization in Release builds" ON)
 
 # Weights
 function(add_zipped_weight_source out_var zip_file output_name)
@@ -68,6 +70,23 @@ target_compile_options(encodec
   PRIVATE $<$<CONFIG:Release>:-ffast-math>)
   
 target_link_libraries(encodec PRIVATE Eigen3::Eigen)
+
+# The decoder consists mostly of small, fixed neural-network layers spread
+# across this translation unit. Letting the linker optimize across object-file
+# boundaries produces a measurable speedup and is supported by both Apple
+# Clang and the Android NDK Clang toolchain. Keep a clean fallback for less
+# capable toolchains.
+if (ENCODEC_ENABLE_IPO)
+  check_ipo_supported(RESULT ENCODEC_IPO_SUPPORTED OUTPUT ENCODEC_IPO_ERROR)
+  if (ENCODEC_IPO_SUPPORTED)
+    # Apply it to targets declared below as well, so the final executable link
+    # performs LTO instead of merely archiving bitcode in libencodec.
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    set_property(TARGET encodec PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+  else()
+    message(WARNING "IPO/LTO is unavailable: ${ENCODEC_IPO_ERROR}")
+  endif()
+endif()
 
 # Example
 add_executable(encodec_example src/examples/main.cpp)

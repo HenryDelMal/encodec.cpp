@@ -25,8 +25,13 @@ return (r != 90 || s != 90);
 }" HAVE_NEON)
 
 if (HAVE_NEON)
+    # AArch64 includes Advanced SIMD/NEON in the base architecture, so no
+    # compiler flag is required. Keep a non-empty capability marker separate
+    # from the optional flags; otherwise find_package_handle_standard_args
+    # incorrectly reports NEON as missing on arm64 Android and Apple Silicon.
+    set(NEON_AVAILABLE TRUE)
     set(NEON_CFLAGS ${CMAKE_REQUIRED_FLAGS})
 endif()
 
 set(CMAKE_REQUIRED_QUIET ${CMAKE_REQUIRED_QUIET_SAV})
-find_package_handle_standard_args(NEON DEFAULT_MSG NEON_CFLAGS)
+find_package_handle_standard_args(NEON DEFAULT_MSG NEON_AVAILABLE)
