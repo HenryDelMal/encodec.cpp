@@ -87,6 +87,17 @@ The file and runtime model use different sample rates/model variants.
 The compressor does not resample automatically. Provide 24 kHz mono to the 24
 kHz model and 48 kHz stereo to the 48 kHz model.
 
+### Process is killed while encoding a long 24 kHz file
+
+Use a build containing the bounded-memory encoder and keep the default
+`--chunk-seconds 30`. Older revisions passed the complete waveform through the
+network at once and could allocate many gigabytes of intermediate tensors.
+
+Every non-final 24 kHz chunk is aligned to the 320-sample codec hop. A one-second
+history window warms the causal convolution and LSTM state before each chunk;
+override it with `--warmup-seconds N`. The history codes are discarded and do
+not alter duration or bitrate.
+
 ### Large repository or executable size
 
 The legacy weights under `src/lib/weights/` are linked into the library. A future

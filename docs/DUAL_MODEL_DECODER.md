@@ -27,6 +27,8 @@ server-side 48 kHz encoding.
 - A non-LM WAV-to-ECDC compressor with 48 kHz segmentation and selectable bitrate.
 - Optional OpenMP intra-model encoder threading with a safe one-thread default.
 - Correct ceil-to-hop padding for partial final encoder frames.
+- Bounded-memory 24 kHz encoding with aligned chunks, continuous bit packing and
+  causal-state warm-up context.
 
 The generated 48 kHz float32 files are approximately 36 MiB for decoder-only and
 65 MiB for the combined encoder/decoder model. They are build artifacts and are
@@ -57,6 +59,10 @@ desirable.
 On a 60-second 24 kHz mono fixture, four OpenMP threads reduced native encoding
 wall time from 5.16 seconds to 2.57 seconds. The one-thread and four-thread ECDC
 outputs were byte-identical.
+
+A 43,374,759-frame 24 kHz mono file that was previously killed by macOS completed
+in 35.5 seconds with four threads, 30-second chunks and one second of warm-up
+context. The resulting 3 kbps ECDC file was approximately 662 KiB.
 
 ## Next milestones
 

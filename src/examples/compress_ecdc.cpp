@@ -132,6 +132,41 @@ void write_be_float(std::ostream& output, float value)
     write_be_u32(output, std::bit_cast<uint32_t>(value));
 }
 
+class packed_bit_writer
+{
+public:
+    explicit packed_bit_writer(std::ostream& output_) : output{output_} {}
+
+    void append(std::span<const uint8_t> bytes, size_t bit_offset, size_t useful_bits)
+    {
+        if (bit_offset + useful_bits > bytes.size()*8)
+            throw std::runtime_error("Encoded packet is shorter than its code count");
+        for (size_t bit = 0; bit < useful_bits; ++bit)
+        {
+            const size_t source_bit = bit_offset + bit;
+            pending |= uint8_t((bytes[source_bit/8] >> (source_bit%8)) & 1u) << pending_bits;
+            if (++pending_bits == 8)
+            {
+                output.put(char(pending));
+                pending = 0;
+                pending_bits = 0;
+            }
+        }
+    }
+
+    void finish()
+    {
+        if (pending_bits != 0) output.put(char(pending));
+        pending = 0;
+        pending_bits = 0;
+    }
+
+private:
+    std::ostream& output;
+    uint8_t pending{};
+    unsigned int pending_bits{};
+};
+
 struct arguments
 {
     std::string model;
@@ -139,6 +174,8 @@ struct arguments
     std::string output;
     double bandwidth_kbps{3.0};
     unsigned int threads{1};
+    unsigned int chunk_seconds{30};
+    unsigned int warmup_seconds{1};
 };
 
 arguments parse_arguments(int argc, char** argv)
@@ -154,13 +191,21 @@ arguments parse_arguments(int argc, char** argv)
             args.bandwidth_kbps = std::stod(argv[++i]);
         else if ((option == "-t" || option == "--threads") && i + 1 < argc)
             args.threads = unsigned(std::stoul(argv[++i]));
+        else if (option == "--chunk-seconds" && i + 1 < argc)
+            args.chunk_seconds = unsigned(std::stoul(argv[++i]));
+        else if (option == "--warmup-seconds" && i + 1 < argc)
+            args.warmup_seconds = unsigned(std::stoul(argv[++i]));
         else throw std::runtime_error("Unknown or incomplete argument: " + option);
     }
     if (args.model.empty() || args.input.empty() || args.output.empty())
-        throw std::runtime_error("Usage: encodec_compress -m MODEL -i INPUT.wav -o OUTPUT.ecdc [-b KBPS] [-t THREADS]");
+        throw std::runtime_error("Usage: encodec_compress -m MODEL -i INPUT.wav -o OUTPUT.ecdc [-b KBPS] [-t THREADS] [--chunk-seconds N] [--warmup-seconds N]");
     if (!(args.bandwidth_kbps > 0.0)) throw std::runtime_error("Bandwidth must be positive");
     if (args.threads == 0 || args.threads > 16)
         throw std::runtime_error("Thread count must be between 1 and 16");
+    if (args.chunk_seconds == 0 || args.chunk_seconds > 3600)
+        throw std::runtime_error("Chunk duration must be between 1 and 3600 seconds");
+    if (args.warmup_seconds > 60)
+        throw std::runtime_error("Warm-up duration must be between 0 and 60 seconds");
     return args;
 }
 } // namespace
@@ -179,17 +224,30 @@ int main(int argc, char** argv)
             throw std::runtime_error("WAV format does not match the selected model");
 
         const uint64_t audio_length = audio.samples.size() / info.channels;
-        const uint64_t segment_length = info.sample_rate == 48000 ? 48000 : audio_length;
-        const uint64_t segment_stride = info.sample_rate == 48000 ? 47520 : audio_length;
+        uint64_t segment_length = 48000;
+        uint64_t segment_stride = 47520;
+        uint64_t warmup_length = 0;
+        if (info.sample_rate == 24000)
+        {
+            segment_length = uint64_t(args.chunk_seconds) * info.sample_rate;
+            segment_length -= segment_length % 320;
+            segment_stride = segment_length;
+            warmup_length = uint64_t(args.warmup_seconds) * info.sample_rate;
+            warmup_length -= warmup_length % 320;
+        }
         const double codebook_kbps = (double(info.sample_rate) / 320.0) * 10.0 / 1000.0;
         const unsigned int codebooks = unsigned(std::llround(args.bandwidth_kbps / codebook_kbps));
         if (codebooks == 0 || codebooks > info.max_quantizers)
             throw std::runtime_error("Bandwidth requires an unsupported number of codebooks");
 
         const std::string model_name = info.sample_rate == 48000 ? "encodec_48khz" : "encodec_24khz";
-        const std::string metadata = "{\"m\":\"" + model_name + "\",\"al\":" +
+        std::string metadata = "{\"m\":\"" + model_name + "\",\"al\":" +
             std::to_string(audio_length) + ",\"nc\":" + std::to_string(codebooks) +
-            ",\"lm\":false}";
+            ",\"lm\":false";
+        if (info.sample_rate == 24000)
+            metadata += ",\"cs\":" + std::to_string(segment_length) +
+                        ",\"cw\":" + std::to_string(warmup_length);
+        metadata += "}";
         std::ofstream output(args.output, std::ios::binary);
         if (!output) throw std::runtime_error("Cannot create output ECDC: " + args.output);
         output.write("ECDC", 4);
@@ -197,19 +255,44 @@ int main(int argc, char** argv)
         write_be_u32(output, uint32_t(metadata.size()));
         output.write(metadata.data(), std::streamsize(metadata.size()));
 
+        packed_bit_writer continuous_codes(output);
         size_t frame_index = 0;
         for (uint64_t offset = 0; offset < audio_length; offset += segment_stride)
         {
             const size_t frames = size_t(std::min<uint64_t>(segment_length, audio_length - offset));
-            const auto first = audio.samples.data() + offset*info.channels;
+            uint64_t source_offset = offset;
+            uint64_t prefix_samples = 0;
+            if (info.sample_rate == 24000 && offset > 0 && warmup_length > 0)
+            {
+                prefix_samples = std::min(warmup_length, offset);
+                prefix_samples -= prefix_samples % 320;
+                source_offset -= prefix_samples;
+            }
+            const auto first = audio.samples.data() + source_offset*info.channels;
+            const size_t input_frames = size_t(prefix_samples) + frames;
             const auto encoded = encoder.encode_frame(
-                std::span<const float>{first, frames*info.channels}, codebooks);
-            if (info.normalized) write_be_float(output, encoded.scale);
-            output.write(reinterpret_cast<const char*>(encoded.packet.data()),
-                         std::streamsize(encoded.packet.size()));
+                std::span<const float>{first, input_frames*info.channels}, codebooks);
+            if (info.normalized)
+            {
+                write_be_float(output, encoded.scale);
+                output.write(reinterpret_cast<const char*>(encoded.packet.data()),
+                             std::streamsize(encoded.packet.size()));
+            }
+            else
+            {
+                const size_t prefix_code_frames = size_t(prefix_samples / 320);
+                const size_t wanted_code_frames = (frames + 319) / 320;
+                if (encoded.code_frames != prefix_code_frames + wanted_code_frames)
+                    throw std::runtime_error("Unexpected code-frame count while chunking");
+                const size_t bit_offset = prefix_code_frames * codebooks * 10;
+                const size_t code_bits = wanted_code_frames * codebooks * 10;
+                continuous_codes.append(encoded.packet, bit_offset, code_bits);
+            }
             if (!output) throw std::runtime_error("Failed while writing ECDC frame");
             std::cerr << "\rEncoded frame " << ++frame_index << std::flush;
         }
+        if (!info.normalized) continuous_codes.finish();
+        if (!output) throw std::runtime_error("Failed while finalizing ECDC codes");
         std::cerr << '\n';
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         std::cout << "Encoded " << audio_length << " frames at " << info.sample_rate << " Hz, "

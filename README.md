@@ -195,8 +195,21 @@ build/encodec_compress \
   --input input-24k-mono.wav \
   --output output.ecdc \
   --bandwidth 3 \
-  --threads 4
+  --threads 4 \
+  --chunk-seconds 30 \
+  --warmup-seconds 1
 ```
+
+Long 24 kHz files are encoded sequentially in bounded-memory chunks. The default
+chunk is 30 seconds, exactly 2,250 codec hops of 320 samples, so intermediate
+boundaries never contain a partial hop. The codes are packed into one continuous
+standard ECDC bitstream; chunks are not encoded concurrently.
+
+Because the 24 kHz model is causal and contains LSTMs, each chunk after the first
+is prefixed with one second of source history by default. Those warm-up codes are
+discarded. This substantially reduces state-reset transients without increasing
+the output duration. It is an approximation rather than fully stateful streaming;
+use a larger `--warmup-seconds` value if a source exposes audible boundaries.
 
 Encode 48 kHz stereo:
 
@@ -295,8 +308,11 @@ are therefore not part of the repository test binary.
 - No LM entropy coding.
 - WAV input only in the compressor; no automatic resampling.
 - No stateful live-streaming API.
-- The 24 kHz CLI encodes a file as one continuous causal stream, so long inputs
-  require substantial working memory.
+- The 24 kHz bounded-memory encoder reconstructs causal state from a configurable
+  warm-up window; it does not yet carry exact convolution and LSTM state between
+  chunks.
+- WAV input is currently loaded into memory even though neural-network working
+  tensors are bounded by `--chunk-seconds`.
 - Runtime model files contain Float32 weights and are not committed.
 
 ## Attribution and license
