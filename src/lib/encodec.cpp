@@ -87,7 +87,7 @@ namespace encodec
     // >1 = beam-search RVQ encoder
     //
     // Suggested starting points: 4, 8, 16.
-    constexpr size_t RVQ_BEAM_SIZE = 8;
+    constexpr size_t RVQ_BEAM_SIZE = 1;
 
     constexpr uint32_t MODEL_CAUSAL = 1u << 0;
     constexpr uint32_t MODEL_NORMALIZED = 1u << 1;
