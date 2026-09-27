@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -79,6 +80,14 @@ namespace encodec
     constexpr unsigned  NLEVELS         = 32;
     constexpr unsigned  CODEBOOK_SIZE   = 1024;
     constexpr unsigned  CODEBOOK_DIM    = 128;
+
+    // RVQ encoder search width.
+    //
+    // 1  = original EnCodec greedy RVQ encoder (bit-identical path)
+    // >1 = beam-search RVQ encoder
+    //
+    // Suggested starting points: 4, 8, 16.
+    constexpr size_t RVQ_BEAM_SIZE = 8;
 
     constexpr uint32_t MODEL_CAUSAL = 1u << 0;
     constexpr uint32_t MODEL_NORMALIZED = 1u << 1;
@@ -234,7 +243,8 @@ namespace encodec
                                                CODEBOOK_SIZE, CODEBOOK_DIM);
         }
 
-        std::span<const uint8_t> encode(std::span<float> feats, size_t nlevels)
+        std::span<const uint8_t> encode(std::span<float> feats, size_t nlevels,
+                                        size_t beam_size = RVQ_BEAM_SIZE)
         {
             // RVQ Encode
             const size_t T = feats.size() / CODEBOOK_DIM;
@@ -243,22 +253,169 @@ namespace encodec
 
             auto X = Eigen::Map<MatrixXf>(&feats[0], T, CODEBOOK_DIM);
 
-            for (size_t l{0} ; l < nlevels ; ++l)
-            {
-                auto C = codebook(l);
-                dists.noalias() = -2.0f * X * C.transpose();
-                dists.rowwise() += Cnorms[l].transpose();
-                
-                for (size_t t{0}; t < T; ++t)
-                {
-                    Eigen::Index best_idx{0};
-                    dists.row(t).minCoeff(&best_idx);
-                    X.row(t) -= C.row(best_idx);
-                    codes[t*nlevels+l] = best_idx;                    
-                }
-            }   
+            if (beam_size == 0)
+                throw std::runtime_error("RVQ beam size must be at least 1");
 
-            // Pack
+            // Keep the original greedy implementation intact for beam_size == 1.
+            // Besides being faster, this provides an exact compatibility/reference
+            // path against the pre-beam-search encoder.
+            if (beam_size == 1)
+            {
+                for (size_t l{0} ; l < nlevels ; ++l)
+                {
+                    auto C = codebook(l);
+                    dists.noalias() = -2.0f * X * C.transpose();
+                    dists.rowwise() += Cnorms[l].transpose();
+
+                    for (size_t t{0}; t < T; ++t)
+                    {
+                        Eigen::Index best_idx{0};
+                        dists.row(t).minCoeff(&best_idx);
+                        X.row(t) -= C.row(best_idx);
+                        codes[t*nlevels+l] = static_cast<uint16_t>(best_idx);
+                    }
+                }
+
+                pack_codes(codes, codes_packed);
+                return codes_packed;
+            }
+
+            // Beam search is performed independently for each latent frame.
+            //
+            // A beam contains:
+            //   - the residual after the codewords selected so far
+            //   - the sequence of selected codebook indices
+            //
+            // At every RVQ level, each active beam is expanded with all 1024
+            // codewords from that level. Only the best `beam_size` resulting
+            // residuals are retained.
+            //
+            // The score is the CURRENT squared residual norm:
+            //
+            //   ||x - sum(q_i)||^2
+            //
+            // We intentionally do not accumulate intermediate errors because
+            // the final residual is the objective that greedy RVQ minimizes
+            // approximately and beam search minimizes more globally.
+            struct beam_candidate
+            {
+                float    error{};
+                size_t   parent{};
+                uint16_t code{};
+            };
+
+            MatrixXf residuals;
+            MatrixXf next_residuals;
+            MatrixXf beam_dists;
+
+            std::vector<std::vector<uint16_t>> paths;
+            std::vector<std::vector<uint16_t>> next_paths;
+            std::vector<beam_candidate> candidates;
+
+            for (size_t t{0}; t < T; ++t)
+            {
+                residuals.resize(1, CODEBOOK_DIM);
+                residuals.row(0) = X.row(t);
+
+                paths.clear();
+                paths.resize(1);
+                paths[0].reserve(nlevels);
+
+                for (size_t l{0}; l < nlevels; ++l)
+                {
+                    auto C = codebook(l);
+                    const size_t active_beams = static_cast<size_t>(residuals.rows());
+
+                    // Squared Euclidean distance:
+                    //
+                    //   ||r-c||^2 = ||r||^2 - 2*r.c + ||c||^2
+                    //
+                    // The original greedy encoder omits ||r||^2 because there
+                    // is only one residual per frame and it is constant across
+                    // all codeword choices. With multiple parent beams, each
+                    // residual has a different norm, so it MUST be included.
+                    beam_dists.noalias() = -2.0f * residuals * C.transpose();
+                    beam_dists.rowwise() += Cnorms[l].transpose();
+
+                    const VectorXf residual_norms =
+                        residuals.rowwise().squaredNorm();
+
+                    beam_dists.colwise() += residual_norms;
+
+                    candidates.clear();
+                    candidates.reserve(active_beams * CODEBOOK_SIZE);
+
+                    for (size_t b{0}; b < active_beams; ++b)
+                    {
+                        for (size_t c{0}; c < CODEBOOK_SIZE; ++c)
+                        {
+                            candidates.push_back({
+                                beam_dists(static_cast<Eigen::Index>(b),
+                                           static_cast<Eigen::Index>(c)),
+                                b,
+                                static_cast<uint16_t>(c)
+                            });
+                        }
+                    }
+
+                    const size_t keep = std::min(beam_size, candidates.size());
+
+                    // Deterministic tie-breaking makes repeated encodes stable.
+                    const auto better = [](const beam_candidate& a,
+                                           const beam_candidate& b)
+                    {
+                        if (a.error < b.error) return true;
+                        if (a.error > b.error) return false;
+                        if (a.parent < b.parent) return true;
+                        if (a.parent > b.parent) return false;
+                        return a.code < b.code;
+                    };
+
+                    if (keep < candidates.size())
+                    {
+                        std::nth_element(candidates.begin(),
+                                         candidates.begin() + keep,
+                                         candidates.end(),
+                                         better);
+                        candidates.resize(keep);
+                    }
+
+                    std::sort(candidates.begin(), candidates.end(), better);
+
+                    next_residuals.resize(static_cast<Eigen::Index>(keep),
+                                          CODEBOOK_DIM);
+                    next_paths.clear();
+                    next_paths.resize(keep);
+
+                    for (size_t b{0}; b < keep; ++b)
+                    {
+                        const auto& candidate = candidates[b];
+
+                        next_residuals.row(static_cast<Eigen::Index>(b)) =
+                            residuals.row(static_cast<Eigen::Index>(candidate.parent))
+                            - C.row(candidate.code);
+
+                        next_paths[b] = paths[candidate.parent];
+                        next_paths[b].push_back(candidate.code);
+                    }
+
+                    residuals.swap(next_residuals);
+                    paths.swap(next_paths);
+                }
+
+                // Candidates were sorted at every stage, therefore beam 0 has
+                // the smallest final residual norm.
+                const auto& best_path = paths.front();
+                for (size_t l{0}; l < nlevels; ++l)
+                    codes[t*nlevels+l] = best_path[l];
+
+                // Preserve the original function's side effect: `feats`
+                // contains the final RVQ residual after encoding.
+                X.row(t) = residuals.row(0);
+            }
+
+            // Packet structure is unchanged: the selected indices are packed
+            // exactly as before (10 bits per codebook index).
             pack_codes(codes, codes_packed);
             return codes_packed;
         }
