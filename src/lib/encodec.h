@@ -47,7 +47,11 @@ namespace encodec
         encoder& operator=(encoder&& other);
 
         std::span<const uint8_t> encode(std::span<const float> audio, unsigned int num_quantizers);
+        std::span<const uint8_t> encode(std::span<const float> audio, unsigned int num_quantizers,
+                                        std::size_t beam_size);
         encoded_frame encode_frame(std::span<const float> audio, unsigned int num_quantizers);
+        encoded_frame encode_frame(std::span<const float> audio, unsigned int num_quantizers,
+                                   std::size_t beam_size);
         model_info info() const;
     };
 

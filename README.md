@@ -274,7 +274,7 @@ encodec::encoder encoder("models/encodec-48khz-f32.bin");
 encodec::decoder decoder("models/encodec-decoder-48khz-f32.bin");
 
 encodec::set_num_threads(4);
-auto frame = encoder.encode_frame(stereo_audio, 2); // 3 kbps at 48 kHz
+auto frame = encoder.encode_frame(stereo_audio, 2, 4); // 3 kbps, RVQ beam size 4
 auto decoded = decoder.decode(frame.packet, 2, frame.code_frames);
 std::vector<float> restored(decoded.begin(), decoded.end());
 
@@ -285,6 +285,10 @@ for (float& sample : restored) {
 
 The packet span returned by an encoder remains owned by that encoder and is
 invalidated by its next encode operation.
+
+The optional third encoder argument selects the RVQ beam-search width. A value
+of `1` uses the original greedy search. Calls that omit it retain the default
+beam size of `8`.
 
 ## Android integration
 

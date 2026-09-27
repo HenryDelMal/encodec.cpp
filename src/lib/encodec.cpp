@@ -990,7 +990,8 @@ namespace encodec
             std::vector<float>().swap(model.decoder_weights);
         }
 
-        encoded_frame encode_frame(std::span<const float> audio, unsigned int num_quantizers)
+        encoded_frame encode_frame(std::span<const float> audio, unsigned int num_quantizers,
+                                   size_t beam_size = RVQ_BEAM_SIZE)
         {
             (void)cpu_threads();
             if (num_quantizers < 1 || num_quantizers > model_info_.max_quantizers)
@@ -1027,12 +1028,13 @@ namespace encodec
             x      = b5(x);
             x      = b6(a6(x));
             const size_t code_frames = x.size() / CODEBOOK_DIM;
-            return {rvq_.encode(x, num_quantizers), code_frames, scale};
+            return {rvq_.encode(x, num_quantizers, beam_size), code_frames, scale};
         }
 
-        std::span<const uint8_t> encode(std::span<const float> audio, unsigned int num_quantizers)
+        std::span<const uint8_t> encode(std::span<const float> audio, unsigned int num_quantizers,
+                                        size_t beam_size = RVQ_BEAM_SIZE)
         {
-            return encode_frame(audio, num_quantizers).packet;
+            return encode_frame(audio, num_quantizers, beam_size).packet;
         }
     };
 
@@ -1135,9 +1137,23 @@ namespace encodec
         return state->encode(audio, num_quantizers);
     }
 
+    std::span<const uint8_t> encoder::encode(std::span<const float> audio,
+                                             unsigned int num_quantizers,
+                                             std::size_t beam_size)
+    {
+        return state->encode(audio, num_quantizers, beam_size);
+    }
+
     encoded_frame encoder::encode_frame(std::span<const float> audio, unsigned int num_quantizers)
     {
         return state->encode_frame(audio, num_quantizers);
+    }
+
+    encoded_frame encoder::encode_frame(std::span<const float> audio,
+                                        unsigned int num_quantizers,
+                                        std::size_t beam_size)
+    {
+        return state->encode_frame(audio, num_quantizers, beam_size);
     }
 
     model_info encoder::info() const { return state->model_info_; }

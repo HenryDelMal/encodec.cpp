@@ -42,4 +42,13 @@ TEST_SUITE("[ENCODEC]")
         const auto decoded = dec.decode(frame.packet, quantizers, frame.code_frames);
         REQUIRE(decoded.size() == frame.code_frames*320);
     }
+
+    TEST_CASE("encoder accepts an explicit RVQ beam size")
+    {
+        encodec::encoder enc;
+        std::vector<float> audio(320, 0.0f);
+        const auto greedy = enc.encode_frame(audio, 1, 1);
+        REQUIRE(greedy.code_frames == 1);
+        REQUIRE(!greedy.packet.empty());
+    }
 }
