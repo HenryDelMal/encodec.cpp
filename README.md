@@ -210,6 +210,7 @@ discarded. This substantially reduces state-reset transients without increasing
 the output duration. It is an approximation rather than fully stateful streaming;
 use a larger `--warmup-seconds` value if a source exposes audible boundaries.
 `--chunk-seconds N` and `--warmup-seconds N` override the automatic choices.
+`--beam-size N` selects the RVQ search width; `1` is the default greedy path.
 
 Encode 48 kHz stereo:
 
@@ -288,7 +289,7 @@ invalidated by its next encode operation.
 
 The optional third encoder argument selects the RVQ beam-search width. A value
 of `1` uses the original greedy search. Calls that omit it retain the default
-beam size of `8`.
+beam size of `1`.
 
 ## Android integration
 

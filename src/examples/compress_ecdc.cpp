@@ -176,6 +176,7 @@ struct arguments
     unsigned int threads{1};
     unsigned int chunk_seconds{};
     unsigned int warmup_seconds{};
+    size_t beam_size{1};
     bool chunk_seconds_set{};
     bool warmup_seconds_set{};
 };
@@ -193,6 +194,8 @@ arguments parse_arguments(int argc, char** argv)
             args.bandwidth_kbps = std::stod(argv[++i]);
         else if ((option == "-t" || option == "--threads") && i + 1 < argc)
             args.threads = unsigned(std::stoul(argv[++i]));
+        else if (option == "--beam-size" && i + 1 < argc)
+            args.beam_size = std::stoul(argv[++i]);
         else if (option == "--chunk-seconds" && i + 1 < argc)
         {
             args.chunk_seconds = unsigned(std::stoul(argv[++i]));
@@ -206,10 +209,11 @@ arguments parse_arguments(int argc, char** argv)
         else throw std::runtime_error("Unknown or incomplete argument: " + option);
     }
     if (args.model.empty() || args.input.empty() || args.output.empty())
-        throw std::runtime_error("Usage: encodec_compress -m MODEL -i INPUT.wav -o OUTPUT.ecdc [-b KBPS] [-t THREADS] [--chunk-seconds N] [--warmup-seconds N]");
+        throw std::runtime_error("Usage: encodec_compress -m MODEL -i INPUT.wav -o OUTPUT.ecdc [-b KBPS] [-t THREADS] [--beam-size N] [--chunk-seconds N] [--warmup-seconds N]");
     if (!(args.bandwidth_kbps > 0.0)) throw std::runtime_error("Bandwidth must be positive");
     if (args.threads == 0 || args.threads > 16)
         throw std::runtime_error("Thread count must be between 1 and 16");
+    if (args.beam_size == 0) throw std::runtime_error("Beam size must be at least 1");
     if (args.chunk_seconds_set && (args.chunk_seconds == 0 || args.chunk_seconds > 3600))
         throw std::runtime_error("Chunk duration must be between 1 and 3600 seconds");
     if (args.warmup_seconds_set && args.warmup_seconds > 60)
@@ -289,7 +293,8 @@ int main(int argc, char** argv)
             const auto first = audio.samples.data() + source_offset*info.channels;
             const size_t input_frames = size_t(prefix_samples) + frames;
             const auto encoded = encoder.encode_frame(
-                std::span<const float>{first, input_frames*info.channels}, codebooks);
+                std::span<const float>{first, input_frames*info.channels}, codebooks,
+                args.beam_size);
             if (info.normalized)
             {
                 write_be_float(output, encoded.scale);
@@ -316,6 +321,7 @@ int main(int argc, char** argv)
         std::cout << "Encoded " << audio_length << " frames at " << info.sample_rate << " Hz, "
                   << info.channels << " channels, " << codebooks << " codebooks ("
                   << codebooks*codebook_kbps << " kbps)\nThreads: " << encodec::get_num_threads()
+                  << ", beam size: " << args.beam_size
                   << "\nElapsed: " << elapsed << " s\n";
     }
     catch (const std::exception& error)
